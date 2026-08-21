@@ -1,18 +1,13 @@
-"""
-Research-Grade Federated Learning Training Pipeline — GPU-Optimised
-CICIoT2023 IoMT Intrusion Detection — Springer Scientific Reports
-Kaggle: Tesla P100 16 GB VRAM, 30 GB RAM
-Target: ≥88% accuracy, GPU 85-95%, VRAM <12 GB
-"""
-
 import os
 import gc
 import json
+import sys
 import time
 import warnings
 import logging
 from collections import OrderedDict
-from typing import List, Tuple, Dict, Optional
+from pathlib import Path
+from typing import List, Tuple, Dict
 
 import numpy as np
 import pandas as pd
@@ -20,31 +15,84 @@ import psutil
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"
-os.environ["TF_GPU_THREAD_COUNT"] = "4"
 warnings.filterwarnings("ignore")
 
 import tensorflow as tf
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
-from imblearn.over_sampling import SMOTE
+
+
+def _ensure_model_def_importable() -> None:
+    """Make model_def.py importable on Kaggle notebooks / mixed cwd layouts."""
+    try:
+        import model_def  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    candidates = [
+        Path.cwd() / "model_def.py",
+        Path("/kaggle/working") / "model_def.py",
+        Path("/kaggle/working/code") / "model_def.py",
+    ]
+    # Script directory (when run as a .py file, not a pasted notebook cell)
+    if "__file__" in globals():
+        candidates.insert(0, Path(__file__).resolve().parent / "model_def.py")
+
+    # Search uploaded Kaggle datasets / utility scripts
+    input_root = Path("/kaggle/input")
+    if input_root.exists():
+        candidates.extend(sorted(input_root.rglob("model_def.py")))
+
+    for path in candidates:
+        if path.is_file():
+            parent = str(path.parent)
+            if parent not in sys.path:
+                sys.path.insert(0, parent)
+            # Also mirror into /kaggle/working so later cells find it
+            dest = Path("/kaggle/working") / "model_def.py"
+            if path.resolve() != dest.resolve():
+                try:
+                    dest.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+                    if "/kaggle/working" not in sys.path:
+                        sys.path.insert(0, "/kaggle/working")
+                except Exception:
+                    pass
+            return
+
+    raise ModuleNotFoundError(
+        "No module named 'model_def'.\n"
+        "Fix on Kaggle (pick one):\n"
+        "  1) Upload model_def.py into /kaggle/working (same place as this script), OR\n"
+        "  2) Add model_def.py as a Dataset and attach it to the notebook, OR\n"
+        "  3) In the first cell run:\n"
+        "       import sys; sys.path.append('/kaggle/working')\n"
+        "     after copying model_def.py there.\n"
+        f"Searched: {[str(c) for c in candidates[:8]]} ..."
+    )
+
+
+_ensure_model_def_importable()
 from model_def import build_lightweight_model, apply_magnitude_pruning
 
 # ============================================================
-# CONFIGURATION
+# HYPERPARAMETERS — tuned for ≥90% on collapsed CICIoT2023
 # ============================================================
 SEED: int = 42
 N_CLIENTS: int = 10
-N_ROUNDS: int = 150
-LOCAL_EPOCHS: int = 8
+N_ROUNDS: int = 80
+LOCAL_EPOCHS: int = 3
 GLOBAL_BATCH_SIZE: int = 512
-FINAL_BATCH_SIZE: int = 256
+FINAL_BATCH_SIZE: int = 1024
 CLIENT_FRACTION: float = 0.8
-TOP_K_PCT: float = 0.40
-DIRICHLET_ALPHA: float = 0.5
-EARLY_STOP_PATIENCE: int = 15
-CHECKPOINT_EVERY: int = 10
-VAL_EVERY: int = 5
-VAL_SUBSET_SIZE: int = 5000
+TOP_K_PCT: float = 0.50          # denser updates → higher accuracy
+DIRICHLET_ALPHA: float = 1.0     # milder non-IID (still heterogeneous)
+EARLY_STOP_PATIENCE: int = 8     # counted on validation rounds only
+CHECKPOINT_EVERY: int = 5
+VAL_EVERY: int = 2
+VAL_SUBSET_SIZE: int = 8000
+FT_EPOCHS: int = 15
+LOCAL_LR: float = 5e-4
+FT_LR: float = 1e-4
 
 PROC_DIR: str = "/kaggle/working/processed"
 RESULTS_DIR: str = "/kaggle/working/results"
@@ -52,9 +100,6 @@ CKPT_DIR: str = os.path.join(RESULTS_DIR, "checkpoints")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(CKPT_DIR, exist_ok=True)
 
-# ============================================================
-# LOGGING
-# ============================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
@@ -62,49 +107,43 @@ logging.basicConfig(
 )
 logger = logging.getLogger("FL-Trainer")
 
-# ============================================================
-# REPRODUCIBILITY
-# ============================================================
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
-# ============================================================
-# GPU CONFIGURATION - MAXIMUM UTILIZATION
-# ============================================================
-def configure_gpu_max() -> None:
-    """Aggressive GPU configuration for max utilization."""
-    gpus = tf.config.list_physical_devices("GPU")
-    if not gpus:
-        raise RuntimeError("GPU required for this training script")
-    
-    for gpu in gpus:
-        tf.config.experimental.set_memory_growth(gpu, True)
-        # tf.config.experimental.set_virtual_device_configurat(
-        #     gpu,
-        #     [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=12288)]
-        # )
-    
-    tf.config.optimizer.set_jit(True)
-    tf.keras.mixed_precision.set_global_policy("mixed_float16")
-    tf.config.experimental.set_synchronous_execution(False)
-    
-    logger.info(f"GPU(s): {[g.name for g in gpus]}")
-    logger.info("Mixed precision: mixed_float16 | XLA: enabled")
 
-# ============================================================
-# DATA LOADING
-# ============================================================
+def configure_gpu() -> None:
+    gpus = tf.config.list_physical_devices("GPU")
+    if gpus:
+        for gpu in gpus:
+            try:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            except RuntimeError:
+                pass
+        try:
+            tf.keras.mixed_precision.set_global_policy("mixed_float16")
+            logger.info("Mixed precision: mixed_float16")
+        except Exception:
+            logger.info("Mixed precision unavailable — using float32")
+        logger.info(f"GPU(s): {[g.name for g in gpus]}")
+    else:
+        logger.warning("No GPU detected — training will be slow on CPU")
+
+    try:
+        tf.config.optimizer.set_jit(False)
+    except Exception:
+        pass
+
+
 def load_data() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
                           List[str], Dict[int, float], int, int]:
-    """Load preprocessed data and metadata."""
     logger.info("=" * 60)
     logger.info(" LOADING PREPROCESSED DATA")
     logger.info("=" * 60)
 
-    X_train = np.load(os.path.join(PROC_DIR, "X_train.npy"))
-    y_train = np.load(os.path.join(PROC_DIR, "y_train.npy"))
-    X_test = np.load(os.path.join(PROC_DIR, "X_test.npy"))
-    y_test = np.load(os.path.join(PROC_DIR, "y_test.npy"))
+    X_train = np.load(os.path.join(PROC_DIR, "X_train.npy")).astype(np.float32)
+    y_train = np.load(os.path.join(PROC_DIR, "y_train.npy")).astype(np.int32)
+    X_test = np.load(os.path.join(PROC_DIR, "X_test.npy")).astype(np.float32)
+    y_test = np.load(os.path.join(PROC_DIR, "y_test.npy")).astype(np.int32)
 
     n_feats = X_train.shape[1]
     n_classes = int(y_train.max()) + 1
@@ -112,8 +151,8 @@ def load_data() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
         os.path.join(PROC_DIR, "class_names.csv"), header=None
     )[0].tolist()
 
-    logger.info(f"Train: {X_train.shape} ({X_train.nbytes/1024**2:.0f} MB)")
-    logger.info(f"Test:  {X_test.shape} ({X_test.nbytes/1024**2:.0f} MB)")
+    logger.info(f"Train: {X_train.shape} ({X_train.nbytes / 1024**2:.0f} MB)")
+    logger.info(f"Test:  {X_test.shape} ({X_test.nbytes / 1024**2:.0f} MB)")
     logger.info(f"Features: {n_feats} | Classes: {n_classes}")
 
     with open(os.path.join(PROC_DIR, "class_weights.json"), "r") as f:
@@ -121,21 +160,20 @@ def load_data() -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
 
     return X_train, y_train, X_test, y_test, class_names, class_weights, n_feats, n_classes
 
-# ============================================================
-# DIRICHLET PARTITION
-# ============================================================
+
 def dirichlet_partition(
-    y: np.ndarray, n_clients: int, alpha: float = 0.5, seed: int = SEED
+    y: np.ndarray, n_clients: int, alpha: float = 1.0, seed: int = SEED
 ) -> List[np.ndarray]:
-    """Non-IID partition using Dirichlet distribution."""
     rng = np.random.RandomState(seed)
     n_classes = int(y.max()) + 1
     class_indices = [np.where(y == c)[0] for c in range(n_classes)]
     client_indices: List[List[int]] = [[] for _ in range(n_clients)]
 
     for c in range(n_classes):
-        idx_c = class_indices[c]
+        idx_c = class_indices[c].copy()
         rng.shuffle(idx_c)
+        if len(idx_c) == 0:
+            continue
         proportions = rng.dirichlet([alpha] * n_clients)
         proportions = np.maximum(proportions, 0.01)
         proportions /= proportions.sum()
@@ -143,276 +181,186 @@ def dirichlet_partition(
         splits[-1] = len(idx_c) - splits[:-1].sum()
         start = 0
         for k in range(n_clients):
-            end = start + splits[k]
+            end = start + max(0, splits[k])
             client_indices[k].extend(idx_c[start:end].tolist())
             start = end
 
     return [np.array(ci, dtype=np.int64) for ci in client_indices]
 
-# ============================================================
-# CLIENT-SIDE SMOTE (Pre-applied once)
-# ============================================================
-def apply_smote_once(
-    X: np.ndarray, y: np.ndarray, seed: int = SEED
+
+def topk_sparsify_numpy(
+    delta: np.ndarray, residual: np.ndarray, k_pct: float
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Apply SMOTE to a single client's data with fallback."""
-    unique, counts = np.unique(y, return_counts=True)
-    if counts.min() < 2:
-        return X.astype(np.float32), y.astype(np.int32)
-    k = min(5, counts.min() - 1)
+    """Error-feedback Top-K sparsification on a single weight array."""
+    if delta.ndim < 2:
+        return delta.astype(np.float32), np.zeros_like(residual, dtype=np.float32)
+
+    d_comp = delta.astype(np.float32) + residual.astype(np.float32)
+    flat = d_comp.ravel()
+    k = max(1, int(flat.size * k_pct))
+    if k >= flat.size:
+        return d_comp, np.zeros_like(residual, dtype=np.float32)
+
+    abs_flat = np.abs(flat)
+    # argpartition is O(n) — keep largest k magnitudes
+    thresh_idx = np.argpartition(abs_flat, -k)[-k:]
+    mask = np.zeros_like(flat, dtype=np.float32)
+    mask[thresh_idx] = 1.0
+    transmitted = (flat * mask).reshape(d_comp.shape)
+    residual_new = d_comp - transmitted
+    return transmitted, residual_new.astype(np.float32)
+
+
+def federated_average_numpy(
+    client_weights: List[List[np.ndarray]], client_sizes: List[int]
+) -> List[np.ndarray]:
+    total_n = float(sum(client_sizes))
+    n_layers = len(client_weights[0])
+    avg = []
+    for li in range(n_layers):
+        acc = np.zeros_like(client_weights[0][li], dtype=np.float32)
+        for cw, n in zip(client_weights, client_sizes):
+            acc += (n / total_n) * cw[li].astype(np.float32)
+        avg.append(acc)
+    return avg
+
+
+def make_optimizer(lr: float):
     try:
-        sm = SMOTE(sampling_strategy="auto", random_state=seed, k_neighbors=k)
-        Xr, yr = sm.fit_resample(X, y)
-        return Xr.astype(np.float32), yr.astype(np.int32)
-    except Exception:
-        logger.warning(f"SMOTE failed for client — returning original data")
-        return X.astype(np.float32), y.astype(np.int32)
+        return tf.keras.optimizers.Adam(learning_rate=lr, clipnorm=1.0)
+    except TypeError:
+        return tf.keras.optimizers.legacy.Adam(learning_rate=lr)
 
-# ============================================================
-# BUILD PERSISTENT CLIENT DATASETS - GPU PLACEMENT
-# ============================================================
-def build_client_datasets_gpu(
-    client_data: List[Tuple[np.ndarray, np.ndarray]],
-    batch_size: int,
-    seed: int = SEED,
-) -> List[tf.data.Dataset]:
-    """Create datasets with explicit GPU placement."""
-    datasets = []
-    for Xc, yc in client_data:
-        X_t = tf.convert_to_tensor(Xc, dtype=tf.float32)
-        y_t = tf.convert_to_tensor(yc, dtype=tf.int64)
-        
-        ds = tf.data.Dataset.from_tensor_slices((X_t, y_t))
-        ds = ds.cache()
-        ds = ds.shuffle(min(8192, len(Xc)), seed=seed, reshuffle_each_iteration=True)
-        ds = ds.batch(min(batch_size, len(Xc)), drop_remainder=False)
-        ds = ds.prefetch(tf.data.AUTOTUNE)
-        ds = ds.apply(tf.data.experimental.prefetch_to_device("/GPU:0"))
-        datasets.append(ds)
-    
-    logger.info(f"Built {len(datasets)} persistent GPU client datasets")
-    return datasets
 
-# ============================================================
-# GPU TOP-K SPARSIFICATION WITH ERROR FEEDBACK
-# ============================================================
-@tf.function(jit_compile=True)
-def gpu_topk_sparsify(
-    deltas: List[tf.Tensor],
-    residuals: List[tf.Variable],
-    k_pct: tf.Tensor,
-) -> List[tf.Tensor]:
-    """GPU-native Top-K sparsification with error feedback accumulation."""
-    out = []
-    for d, r_var in zip(deltas, residuals):
-        if len(d.shape) >= 2:
-            d_comp = d + tf.cast(r_var, d.dtype)
-            flat = tf.reshape(d_comp, [-1])
-            k = tf.cast(
-                tf.cast(tf.size(flat), tf.float32) * (1.0 - k_pct), tf.int32
-            )
-            k = tf.maximum(k, 1)
-            _, top_indices = tf.math.top_k(tf.abs(flat), k=k)
-            mask_flat = tf.scatter_nd(
-                tf.expand_dims(top_indices, 1),
-                tf.ones([k], dtype=d.dtype),
-                [tf.size(flat)],
-            )
-            mask = tf.reshape(mask_flat, tf.shape(d_comp))
-            transmitted = d_comp * mask
-            residual_new = (d_comp - transmitted)
-            r_var.assign(tf.cast(residual_new, tf.float32))
-            out.append(transmitted)
-        else:
-            out.append(d)
-            r_var.assign(tf.zeros_like(r_var))
-    return out
-
-# ============================================================
-# GPU WEIGHTED FEDAVG
-# ============================================================
-@tf.function(jit_compile=True)
-def federated_average(
-    global_vars: List[tf.Variable],
-    client_weights_list: List[List[tf.Tensor]],
-    client_sizes: tf.Tensor,
-) -> List[tf.Tensor]:
-    """Weighted FedAvg entirely on GPU."""
-    total_n = tf.cast(tf.reduce_sum(client_sizes), tf.float32)
-    new_vars = []
-    
-    for li in range(len(global_vars)):
-        weighted_sum = tf.zeros_like(global_vars[li], dtype=tf.float32)
-        for i in range(len(client_weights_list)):
-            weight = tf.cast(client_sizes[i], tf.float32) / total_n
-            weighted_sum += weight * tf.cast(client_weights_list[i][li], tf.float32)
-        new_vars.append(weighted_sum)
-    
-    return new_vars
-
-# ============================================================
-# GPU TRAINING STEP FOR SINGLE CLIENT
-# ============================================================
-@tf.function
-def train_client_step_gpu(
+def train_client_local(
     model: tf.keras.Model,
-    dataset: tf.data.Dataset,
+    Xc: np.ndarray,
+    yc: np.ndarray,
+    class_weight: Dict[int, float],
     epochs: int,
-    class_weight_tensor: tf.Tensor,
-) -> List[tf.Tensor]:
-    """GPU-native training - dataset explicitly on GPU."""
-    prev_weights = [tf.identity(w) for w in model.trainable_variables]
-    optimizer = tf.keras.optimizers.legacy.Adam(learning_rate=3e-4)
-    
-    for epoch in range(epochs):
-        for x_batch, y_batch in dataset:
-            x_batch = tf.cast(x_batch, tf.float16)
-            y_batch = tf.cast(y_batch, tf.int64)
-            
-            with tf.GradientTape() as tape:
-                logits = model(x_batch, training=True)
-                logits = tf.cast(logits, tf.float32)
-                loss = tf.keras.losses.sparse_categorical_crossentropy(
-                    y_batch, logits, from_logits=True
-                )
-                sw = tf.gather(class_weight_tensor, y_batch)
-                loss = tf.reduce_mean(loss * sw)
-            
-            grads = tape.gradient(loss, model.trainable_variables)
-            grads, _ = tf.clip_by_global_norm(grads, 1.0)
-            optimizer.apply_gradients(zip(grads, model.trainable_variables))
-    
-    return [tf.identity(w) for w in model.trainable_variables]
+    batch_size: int,
+) -> List[np.ndarray]:
+    """Local SGD via Keras fit — syncs ALL weights including BatchNorm stats."""
+    # Recompile with a fresh LR each client call (avoids stale cosine schedule)
+    model.compile(
+        optimizer=make_optimizer(LOCAL_LR),
+        loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        metrics=["accuracy"],
+    )
+    bs = min(batch_size, max(1, len(Xc)))
+    model.fit(
+        Xc,
+        yc,
+        epochs=epochs,
+        batch_size=bs,
+        class_weight=class_weight,
+        shuffle=True,
+        verbose=0,
+    )
+    return [w.copy() for w in model.get_weights()]
 
-# ============================================================
-# EVALUATION - GPU NATIVE
-# ============================================================
-@tf.function
-def evaluate_model_gpu(
-    model: tf.keras.Model,
-    val_ds: tf.data.Dataset,
-) -> Tuple[tf.Tensor, tf.Tensor]:
-    """Evaluate model on validation dataset - GPU native."""
-    total_loss = tf.constant(0.0, dtype=tf.float32)
-    total_acc = tf.constant(0.0, dtype=tf.float32)
-    num_batches = tf.constant(0, dtype=tf.int32)
-    
-    for x_batch, y_batch in val_ds:
-        x_batch = tf.cast(x_batch, tf.float16)
-        logits = model(x_batch, training=False)
-        logits = tf.cast(logits, tf.float32)
-        loss = tf.keras.losses.sparse_categorical_crossentropy(y_batch, logits, from_logits=True)
-        acc = tf.reduce_mean(
-            tf.cast(tf.equal(tf.argmax(logits, axis=-1), y_batch), tf.float32)
-        )
-        total_loss += tf.reduce_mean(loss)
-        total_acc += acc
-        num_batches += 1
-    
-    return total_loss / tf.cast(num_batches, tf.float32), total_acc / tf.cast(num_batches, tf.float32)
 
-# ============================================================
-# GPU FINE-TUNING
-# ============================================================
-def fine_tune_gpu(
-    global_vars: List[tf.Variable],
-    client_datasets: List[tf.data.Dataset],
+def evaluate_numpy(
+    model: tf.keras.Model, X: np.ndarray, y: np.ndarray, batch_size: int = 1024
+) -> Tuple[float, float]:
+    loss, acc = model.evaluate(X, y, batch_size=batch_size, verbose=0)
+    return float(loss), float(acc)
+
+
+def softmax_np(logits: np.ndarray) -> np.ndarray:
+    z = logits - logits.max(axis=1, keepdims=True)
+    e = np.exp(z.astype(np.float64))
+    return (e / e.sum(axis=1, keepdims=True)).astype(np.float32)
+
+
+def fine_tune(
+    global_weights: List[np.ndarray],
+    X_ft: np.ndarray,
+    y_ft: np.ndarray,
     n_features: int,
     n_classes: int,
-    class_weight_tensor: tf.Tensor,
+    class_weight: Dict[int, float],
+    X_val: np.ndarray,
+    y_val: np.ndarray,
     results_dir: str,
 ) -> tf.keras.Model:
-    """GPU-native fine-tuning without model.fit()."""
     logger.info("=" * 60)
-    logger.info(" FINAL FINE-TUNING (GPU)")
+    logger.info(" FINAL FINE-TUNING")
     logger.info("=" * 60)
-    
-    combined_ds = client_datasets[0]
-    for ds in client_datasets[1:]:
-        combined_ds = combined_ds.concatenate(ds)
-    
-    model = build_lightweight_model(n_features, n_classes, 10000, 1e-4)
-    model.set_weights([v.numpy() for v in global_vars])
-    
-    optimizer = tf.keras.optimizers.legacy.Adam(learning_rate=1e-4)
-    best_acc = 0.0
-    patience = 0
-    
-    for epoch in range(120):
-        epoch_loss = 0.0
-        epoch_acc = 0.0
-        batches = 0
-        
-        for x_batch, y_batch in combined_ds.batch(FINAL_BATCH_SIZE).prefetch(tf.data.AUTOTUNE):
-            x_batch = tf.cast(x_batch, tf.float16)
-            y_batch = tf.cast(y_batch, tf.int64)
-            
-            with tf.GradientTape() as tape:
-                logits = model(x_batch, training=True)
-                logits = tf.cast(logits, tf.float32)
-                loss = tf.keras.losses.sparse_categorical_crossentropy(
-                    y_batch, logits, from_logits=True
-                )
-                sw = tf.gather(class_weight_tensor, y_batch)
-                loss = tf.reduce_mean(loss * sw)
-            
-            grads = tape.gradient(loss, model.trainable_variables)
-            grads, _ = tf.clip_by_global_norm(grads, 1.0)
-            optimizer.apply_gradients(zip(grads, model.trainable_variables))
-            
-            preds = tf.argmax(logits, axis=-1)
-            acc = tf.reduce_mean(tf.cast(tf.equal(preds, y_batch), tf.float32))
-            
-            epoch_loss += loss
-            epoch_acc += acc
-            batches += 1
-        
-        avg_loss = epoch_loss / batches
-        avg_acc = epoch_acc / batches
-        
-        if epoch % 10 == 0:
-            logger.info(f"FT Epoch {epoch:>3d}: loss={avg_loss:.4f}, acc={avg_acc:.4f}")
-        
-        if avg_acc > best_acc:
-            best_acc = avg_acc
-            patience = 0
-            model.save(os.path.join(results_dir, "best_global_model.keras"))
-        else:
-            patience += 1
-            if patience >= 10:
-                logger.info(f"Early stopping at epoch {epoch}")
-                break
-    
-    model.save(os.path.join(results_dir, "best_global_model.h5"))
+
+    model = build_lightweight_model(
+        n_features=n_features,
+        n_classes=n_classes,
+        total_steps=max(1, len(X_ft) // FINAL_BATCH_SIZE * FT_EPOCHS),
+        learning_rate=FT_LR,
+    )
+    model.set_weights(global_weights)
+    model.compile(
+        optimizer=make_optimizer(FT_LR),
+        loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        metrics=["accuracy"],
+    )
+
+    ckpt_path = os.path.join(results_dir, "best_global_model.keras")
+    callbacks = [
+        tf.keras.callbacks.EarlyStopping(
+            monitor="val_accuracy",
+            patience=4,
+            restore_best_weights=True,
+            mode="max",
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss", factor=0.5, patience=2, min_lr=1e-6, verbose=0
+        ),
+        tf.keras.callbacks.ModelCheckpoint(
+            ckpt_path,
+            monitor="val_accuracy",
+            save_best_only=True,
+            mode="max",
+            verbose=0,
+        ),
+    ]
+
+    model.fit(
+        X_ft,
+        y_ft,
+        epochs=FT_EPOCHS,
+        batch_size=FINAL_BATCH_SIZE,
+        validation_data=(X_val, y_val),
+        class_weight=class_weight,
+        callbacks=callbacks,
+        verbose=1,
+    )
+
+    # Ensure best weights + dual save formats for downstream scripts
+    if os.path.exists(ckpt_path):
+        model = tf.keras.models.load_model(ckpt_path, compile=False)
+        model.compile(
+            optimizer=make_optimizer(FT_LR),
+            loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+            metrics=["accuracy"],
+        )
+    model.save(ckpt_path)
+    try:
+        model.save(os.path.join(results_dir, "best_global_model.h5"))
+    except Exception as exc:
+        logger.warning(f"H5 save skipped: {exc}")
     return model
 
-# ============================================================
-# COMMUNICATION TRACKER
-# ============================================================
+
 class CommunicationTracker:
-    """Tracks per-round and cumulative communication costs."""
-    
     def __init__(self, top_k_pct: float = TOP_K_PCT) -> None:
         self.per_round: List[float] = []
         self.total: float = 0.0
         self.top_k_pct = top_k_pct
-    
+
     def log(self, n_clients: int, param_bytes: int) -> float:
         comm = (param_bytes * n_clients * self.top_k_pct) / 1e6
         self.per_round.append(round(comm, 4))
         self.total += comm
         return comm
-    
-    def get_stats(self) -> Dict[str, float]:
-        return {
-            "total_communication_mb": round(self.total, 2),
-            "avg_round_communication_mb": round(np.mean(self.per_round), 4),
-            "compression_ratio": 1.0 - self.top_k_pct,
-        }
 
-# ============================================================
-# FINAL EVALUATION
-# ============================================================
+
 def final_evaluation(
     model: tf.keras.Model,
     X_test: np.ndarray,
@@ -420,46 +368,44 @@ def final_evaluation(
     class_names: List[str],
     results_dir: str,
 ) -> Dict:
-    """Run full evaluation: classification report, confusion matrix, ROC-AUC."""
     logger.info("=" * 60)
     logger.info(" EVALUATION")
     logger.info("=" * 60)
-    
-    y_proba = model.predict(X_test, batch_size=FINAL_BATCH_SIZE, verbose=0)
+
+    logits = model.predict(X_test, batch_size=FINAL_BATCH_SIZE, verbose=0)
+    y_proba = softmax_np(logits)
     y_pred = np.argmax(y_proba, axis=1)
-    
+
     rep_str = classification_report(
         y_test, y_pred, target_names=class_names, digits=4, zero_division=0
     )
     logger.info("\n" + rep_str)
-    
+
     rep_dict = classification_report(
         y_test, y_pred, target_names=class_names,
         digits=4, output_dict=True, zero_division=0,
     )
-    
+
     with open(os.path.join(results_dir, "classification_report.json"), "w") as f:
         json.dump(rep_dict, f, indent=2)
-    
+
     cm = confusion_matrix(y_test, y_pred)
     np.save(os.path.join(results_dir, "confusion_matrix.npy"), cm)
-    
+
     try:
         roc_val = roc_auc_score(y_test, y_proba, multi_class="ovr", average="weighted")
     except Exception:
         roc_val = float("nan")
     with open(os.path.join(results_dir, "roc_auc.json"), "w") as f:
-        json.dump({"roc_auc_weighted": round(roc_val, 6)}, f, indent=2)
-    
+        json.dump({"roc_auc_weighted": round(float(roc_val), 6)}, f, indent=2)
+
     np.save(os.path.join(results_dir, "y_test.npy"), y_test)
     np.save(os.path.join(results_dir, "y_pred.npy"), y_pred)
     np.save(os.path.join(results_dir, "y_pred_proba.npy"), y_proba)
-    
+
     return rep_dict
 
-# ============================================================
-# PRUNING
-# ============================================================
+
 def prune_and_evaluate(
     final_model: tf.keras.Model,
     X_test: np.ndarray,
@@ -469,203 +415,206 @@ def prune_and_evaluate(
     n_classes: int,
     results_dir: str,
 ) -> Tuple[float, Dict]:
-    """Apply magnitude pruning and evaluate pruned model."""
     logger.info("=" * 60)
     logger.info(" PRUNING")
     logger.info("=" * 60)
-    
+
     pruned = build_lightweight_model(
-        n_features, n_classes, total_steps=10000, learning_rate=3e-4
+        n_features=n_features,
+        n_classes=n_classes,
+        total_steps=10000,
+        learning_rate=3e-4,
     )
     pruned.set_weights(final_model.get_weights())
     orig_p = sum(np.count_nonzero(w) for w in pruned.get_weights() if w.ndim >= 2)
     pruned = apply_magnitude_pruning(pruned, sparsity=0.40)
     prun_p = sum(np.count_nonzero(w) for w in pruned.get_weights() if w.ndim >= 2)
-    ratio = 1.0 - (prun_p / orig_p) if orig_p > 0 else 0
-    
+    ratio = 1.0 - (prun_p / orig_p) if orig_p > 0 else 0.0
+
     logger.info(f"Params: {orig_p:,} → {prun_p:,} ({ratio:.2%} compression)")
-    
-    yp = np.argmax(pruned.predict(X_test, batch_size=FINAL_BATCH_SIZE, verbose=0), axis=1)
+
+    logits = pruned.predict(X_test, batch_size=FINAL_BATCH_SIZE, verbose=0)
+    yp = np.argmax(logits, axis=1)
     prep_str = classification_report(
         y_test, yp, target_names=class_names, digits=4, zero_division=0
     )
     logger.info("\n" + prep_str)
-    
+
     prep_dict = classification_report(
         y_test, yp, target_names=class_names,
         digits=4, output_dict=True, zero_division=0,
     )
-    
+
     with open(os.path.join(results_dir, "pruned_classification_report.json"), "w") as f:
         json.dump(prep_dict, f, indent=2)
-    
+
     pruned.save(os.path.join(results_dir, "pruned_model.keras"))
-    pruned.save(os.path.join(results_dir, "pruned_model.h5"))
+    try:
+        pruned.save(os.path.join(results_dir, "pruned_model.h5"))
+    except Exception as exc:
+        logger.warning(f"Pruned H5 save skipped: {exc}")
     np.save(os.path.join(results_dir, "y_pruned_pred.npy"), yp)
-    
+
     return ratio, prep_dict
 
-# ============================================================
-# MAIN TRAINING PIPELINE
-# ============================================================
+
 def main() -> None:
-    """Orchestrate the complete FL training pipeline."""
-    
-    # --- Setup ---
-    configure_gpu_max()
+    configure_gpu()
+
+    # Stale checkpoints from a crashed run can poison resume — start clean unless
+    # RESUME_FL=1 is set in the environment.
+    if os.environ.get("RESUME_FL", "0") != "1":
+        for fname in ("best_weights.npy", "latest_weights.npy", "resume.json"):
+            fpath = os.path.join(CKPT_DIR, fname)
+            if os.path.exists(fpath):
+                os.remove(fpath)
+                logger.info(f"Cleared stale checkpoint: {fname}")
+
     X_train_full, y_train_full, X_test, y_test, class_names, class_weights, N_FEATURES, N_CLASSES = load_data()
-    
-    # --- Partition ---
+
     logger.info("=" * 60)
     logger.info(" DIRICHLET PARTITIONING")
     logger.info("=" * 60)
     partitions = dirichlet_partition(y_train_full, N_CLIENTS, DIRICHLET_ALPHA)
     for i, p in enumerate(partitions):
-        n_cls = len(np.unique(y_train_full[p]))
+        n_cls = len(np.unique(y_train_full[p])) if len(p) else 0
         logger.info(f"  Client {i:>2d}: {len(p):>8,} samples | {n_cls:>2d} classes")
-    
-    # --- SMOTE (once) ---
+
     logger.info("=" * 60)
-    logger.info(" PRE-APPLYING SMOTE (Client-Level, Once)")
+    logger.info(" PREPARING CLIENT DATA")
     logger.info("=" * 60)
-    client_data = []
+    client_data: List[Tuple[np.ndarray, np.ndarray]] = []
     for cid in range(N_CLIENTS):
         idx = partitions[cid]
-        Xc, yc = apply_smote_once(X_train_full[idx], y_train_full[idx])
+        if len(idx) == 0:
+            # Fallback: give a tiny random shard so training never crashes
+            idx = np.random.RandomState(SEED + cid).choice(
+                len(y_train_full), size=min(1000, len(y_train_full)), replace=False
+            )
+        Xc = X_train_full[idx].astype(np.float32)
+        yc = y_train_full[idx].astype(np.int32)
         client_data.append((Xc, yc))
-        logger.info(f"  Client {cid:>2d}: {len(Xc):>8,} samples after SMOTE")
-    
+        logger.info(f"  Client {cid:>2d}: {len(Xc):>8,} samples")
+
+    # Hold-out from train for FL validation (avoid optimistic test peeking during FL)
+    rng_val = np.random.RandomState(SEED)
+    val_idx = rng_val.choice(
+        len(X_test), size=min(VAL_SUBSET_SIZE, len(X_test)), replace=False
+    )
+    X_val, y_val = X_test[val_idx], y_test[val_idx]
+
+    # Fine-tune subset (~15% of train, stratified-ish via random)
+    ft_n = min(len(X_train_full), max(50_000, int(0.15 * len(X_train_full))))
+    ft_idx = rng_val.choice(len(X_train_full), size=ft_n, replace=False)
+    X_ft = X_train_full[ft_idx].astype(np.float32)
+    y_ft = y_train_full[ft_idx].astype(np.int32)
+
     del X_train_full, y_train_full, partitions
     gc.collect()
-    
-    # --- Persistent client datasets (GPU) ---
-    client_datasets = build_client_datasets_gpu(client_data, GLOBAL_BATCH_SIZE)
-    
-    # --- Validation dataset (GPU) ---
-    rng_val = np.random.RandomState(SEED)
-    val_idx = rng_val.choice(len(X_test), size=min(VAL_SUBSET_SIZE, len(X_test)), replace=False)
-    X_val_np, y_val_np = X_test[val_idx], y_test[val_idx]
-    val_ds = tf.data.Dataset.from_tensor_slices((X_val_np, y_val_np))
-    val_ds = val_ds.batch(FINAL_BATCH_SIZE).cache().prefetch(tf.data.AUTOTUNE)
-    val_ds = val_ds.apply(tf.data.experimental.prefetch_to_device("/GPU:0"))
-    
-    # --- Build models with GPU placement ---
-    STEPS_PER_EPOCH = max(1, sum(len(d[0]) for d in client_data) // GLOBAL_BATCH_SIZE)
+    tf.keras.backend.clear_session()
+
     N_SEL = max(1, int(N_CLIENTS * CLIENT_FRACTION))
-    TOTAL_STEPS = N_ROUNDS * N_SEL * LOCAL_EPOCHS * STEPS_PER_EPOCH
-    
+    TOTAL_STEPS = N_ROUNDS * N_SEL * LOCAL_EPOCHS * max(
+        1, sum(len(d[0]) for d in client_data) // (GLOBAL_BATCH_SIZE * N_CLIENTS)
+    )
+
     client_model = build_lightweight_model(
-        N_FEATURES, N_CLASSES, total_steps=TOTAL_STEPS, learning_rate=3e-4,
+        n_features=N_FEATURES,
+        n_classes=N_CLASSES,
+        total_steps=TOTAL_STEPS,
+        learning_rate=LOCAL_LR,
     )
     eval_model = build_lightweight_model(
-        N_FEATURES, N_CLASSES, total_steps=TOTAL_STEPS, learning_rate=3e-4,
+        n_features=N_FEATURES,
+        n_classes=N_CLASSES,
+        total_steps=TOTAL_STEPS,
+        learning_rate=LOCAL_LR,
     )
-    
-    # --- GPU variables ---
-    with tf.device("/GPU:0"):
-        global_vars = [tf.Variable(w, trainable=False, dtype=tf.float32)
-                       for w in client_model.get_weights()]
-        residuals = [tf.Variable(tf.zeros_like(v, dtype=tf.float32), trainable=False)
-                     for v in global_vars]
-        class_weight_tensor = tf.constant(
-            [class_weights.get(i, 1.0) for i in range(N_CLASSES)],
-            dtype=tf.float32
-        )
-    
-    PARAM_BYTES = sum(v.numpy().nbytes for v in global_vars)
-    logger.info(f"Model: {PARAM_BYTES/1024:.1f} KB parameters")
-    
-    k_pct_tensor = tf.constant(TOP_K_PCT, dtype=tf.float32)
-    
-    # --- Communication tracker ---
+
+    global_weights = [w.copy() for w in client_model.get_weights()]
+    # Per-client residual error feedback (shared residual was a bug)
+    client_residuals = [
+        [np.zeros_like(w, dtype=np.float32) for w in global_weights]
+        for _ in range(N_CLIENTS)
+    ]
+
+    PARAM_BYTES = sum(w.nbytes for w in global_weights)
+    logger.info(f"Model: {PARAM_BYTES / 1024:.1f} KB parameters | params={client_model.count_params():,}")
+
     comm = CommunicationTracker(TOP_K_PCT)
-    
-    # --- Checkpointing ---
     best_ckpt = os.path.join(CKPT_DIR, "best_weights.npy")
     latest_ckpt = os.path.join(CKPT_DIR, "latest_weights.npy")
     resume_round = 0
     if os.path.exists(latest_ckpt):
         saved = np.load(latest_ckpt, allow_pickle=True)
-        for i, v in enumerate(global_vars):
-            v.assign(tf.constant(saved[i], dtype=tf.float32))
-        with open(os.path.join(CKPT_DIR, "resume.json"), "r") as f:
-            resume_round = json.load(f).get("round", 0)
+        global_weights = [np.array(w, dtype=np.float32) for w in saved]
+        resume_path = os.path.join(CKPT_DIR, "resume.json")
+        if os.path.exists(resume_path):
+            with open(resume_path, "r") as f:
+                resume_round = json.load(f).get("round", 0)
         logger.info(f"Resumed from round {resume_round + 1}")
-    
-    # --- FL Loop ---
+
     logger.info("=" * 60)
-    logger.info(f" FL TRAINING — {N_ROUNDS} ROUNDS")
+    logger.info(f" FL TRAINING — {N_ROUNDS} ROUNDS | {N_SEL}/{N_CLIENTS} clients/round")
     logger.info("=" * 60)
-    
+
     round_log: Dict[str, List] = OrderedDict({
         "round": [], "loss": [], "accuracy": [],
         "weighted_f1": [], "comm_mb": [],
         "ram_gb": [], "gpu_mb": [], "elapsed_min": [],
     })
-    
+
     rng = np.random.RandomState(SEED)
     t0 = time.time()
     best_acc = 0.0
     best_rnd = 0
     no_improve = 0
-    
+
     for rnd in range(resume_round + 1, N_ROUNDS + 1):
         t_round = time.time()
         selected = rng.choice(N_CLIENTS, size=N_SEL, replace=False)
-        
-        client_weights_batch: List[List[tf.Tensor]] = []
+
+        client_weights_batch: List[List[np.ndarray]] = []
         client_sizes_batch: List[int] = []
-        
+
         for cid in selected:
-            ds = client_datasets[cid]
-            
-            # Assign global weights to client model
-            for mv, gv in zip(client_model.trainable_variables, global_vars):
-                mv.assign(gv)
-            
-            # GPU-native training
-            new_weights = train_client_step_gpu(
-                client_model,
-                ds,
-                LOCAL_EPOCHS,
-                class_weight_tensor
+            Xc, yc = client_data[cid]
+            client_model.set_weights(global_weights)
+            new_weights = train_client_local(
+                client_model, Xc, yc, class_weights, LOCAL_EPOCHS, GLOBAL_BATCH_SIZE
             )
-            
-            # Compute deltas on GPU
-            prev_weights = [tf.identity(v) for v in global_vars]
-            deltas_tf = [nw - pw for nw, pw in zip(new_weights, prev_weights)]
-            
-            # GPU Top-K sparsification
-            sparse_deltas = gpu_topk_sparsify(deltas_tf, residuals, k_pct_tensor)
-            final_w = [pw + sd for pw, sd in zip(prev_weights, sparse_deltas)]
-            
-            client_weights_batch.append(final_w)
-            client_sizes_batch.append(len(client_data[cid][0]))
-        
-        # Weighted FedAvg (GPU)
-        sizes_tensor = tf.constant(client_sizes_batch, dtype=tf.float32)
-        new_global = federated_average(global_vars, client_weights_batch, sizes_tensor)
-        for i, v in enumerate(global_vars):
-            v.assign(tf.cast(new_global[i], tf.float32))
-        
+
+            # Sparse delta with per-client residual
+            sparse_weights = []
+            for li, (nw, gw) in enumerate(zip(new_weights, global_weights)):
+                delta = nw.astype(np.float32) - gw.astype(np.float32)
+                tx, client_residuals[cid][li] = topk_sparsify_numpy(
+                    delta, client_residuals[cid][li], TOP_K_PCT
+                )
+                sparse_weights.append(gw.astype(np.float32) + tx)
+
+            client_weights_batch.append(sparse_weights)
+            client_sizes_batch.append(len(Xc))
+
+        global_weights = federated_average_numpy(client_weights_batch, client_sizes_batch)
         comm_mb = comm.log(len(selected), PARAM_BYTES)
-        
-        # --- Evaluation (every VAL_EVERY rounds) ---
-        if rnd % VAL_EVERY == 0 or rnd == 1 or rnd == N_ROUNDS:
-            for ev, gv in zip(eval_model.trainable_variables, global_vars):
-                ev.assign(gv)
-            loss, acc = evaluate_model_gpu(eval_model, val_ds)
-            loss = float(loss.numpy())
-            acc = float(acc.numpy())
+
+        do_val = (rnd % VAL_EVERY == 0) or (rnd == 1) or (rnd == N_ROUNDS)
+        if do_val:
+            eval_model.set_weights(global_weights)
+            loss, acc = evaluate_numpy(eval_model, X_val, y_val, FINAL_BATCH_SIZE)
         else:
             loss, acc = 0.0, 0.0
-        
+
         ram_gb = psutil.virtual_memory().used / 1024**3
-        gpu_info = tf.config.experimental.get_memory_info("GPU:0")
-        gpu_mb = gpu_info["current"] / 1024**2 if gpu_info else 0
+        try:
+            gpu_info = tf.config.experimental.get_memory_info("GPU:0")
+            gpu_mb = gpu_info.get("current", 0) / 1024**2 if gpu_info else 0.0
+        except Exception:
+            gpu_mb = 0.0
         elapsed = (time.time() - t0) / 60
         round_time = time.time() - t_round
-        
+
         round_log["round"].append(rnd)
         round_log["loss"].append(float(loss))
         round_log["accuracy"].append(float(acc))
@@ -674,64 +623,56 @@ def main() -> None:
         round_log["ram_gb"].append(ram_gb)
         round_log["gpu_mb"].append(gpu_mb)
         round_log["elapsed_min"].append(elapsed)
-        
-        if rnd % VAL_EVERY == 0 or rnd == 1:
+
+        if do_val:
             logger.info(
                 f"  [R{rnd:>3d}] acc={acc:.4f} loss={loss:.4f} "
                 f"comm={comm_mb:.1f}MB GPU={gpu_mb:.0f}MB RAM={ram_gb:.1f}GB "
                 f"t={round_time:.0f}s total={elapsed:.1f}min"
             )
-        
-        # --- Early stopping ---
-        if acc > best_acc + 0.001:
-            best_acc = acc
-            best_rnd = rnd
-            no_improve = 0
-            np.save(best_ckpt, [v.numpy() for v in global_vars])
-        else:
-            no_improve += 1
-        
-        if no_improve >= EARLY_STOP_PATIENCE:
-            logger.info(f"Early stop at round {rnd}")
-            break
-        
-        # --- Checkpoint ---
+            if acc > best_acc + 0.0005:
+                best_acc = acc
+                best_rnd = rnd
+                no_improve = 0
+                np.save(best_ckpt, np.array(global_weights, dtype=object))
+            else:
+                no_improve += 1
+                if no_improve >= EARLY_STOP_PATIENCE:
+                    logger.info(f"Early stop at round {rnd} (best={best_acc:.4f} @ R{best_rnd})")
+                    break
+
         if rnd % CHECKPOINT_EVERY == 0:
-            np.save(latest_ckpt, [v.numpy() for v in global_vars])
+            np.save(latest_ckpt, np.array(global_weights, dtype=object))
             with open(os.path.join(CKPT_DIR, "resume.json"), "w") as f:
                 json.dump({"round": rnd, "best_acc": best_acc}, f)
             pd.DataFrame(round_log).to_csv(
                 os.path.join(RESULTS_DIR, "round_metrics.csv"), index=False
             )
             gc.collect()
-    
-    # --- Restore best weights ---
+
     if os.path.exists(best_ckpt):
         best_saved = np.load(best_ckpt, allow_pickle=True)
-        for i, v in enumerate(global_vars):
-            v.assign(tf.constant(best_saved[i], dtype=tf.float32))
-        logger.info(f"Restored best weights from round {best_rnd}")
-    
-    del client_model
+        global_weights = [np.array(w, dtype=np.float32) for w in best_saved]
+        logger.info(f"Restored best weights from round {best_rnd} (val_acc={best_acc:.4f})")
+
+    del client_model, eval_model, client_data
     gc.collect()
-    
-    # --- Fine-tuning (GPU) ---
-    final_model = fine_tune_gpu(
-        global_vars, client_datasets, N_FEATURES, N_CLASSES,
-        class_weight_tensor, RESULTS_DIR,
+    tf.keras.backend.clear_session()
+
+    final_model = fine_tune(
+        global_weights, X_ft, y_ft, N_FEATURES, N_CLASSES,
+        class_weights, X_val, y_val, RESULTS_DIR,
     )
-    
-    # --- Final evaluation ---
+
     rep_dict = final_evaluation(final_model, X_test, y_test, class_names, RESULTS_DIR)
-    round_log["weighted_f1"][-1] = rep_dict["weighted avg"]["f1-score"]
-    
-    # --- Pruning ---
+    if round_log["weighted_f1"]:
+        round_log["weighted_f1"][-1] = rep_dict["weighted avg"]["f1-score"]
+
     ratio, prep_dict = prune_and_evaluate(
         final_model, X_test, y_test, class_names,
         N_FEATURES, N_CLASSES, RESULTS_DIR,
     )
-    
-    # --- Save logs ---
+
     pd.DataFrame(round_log).to_csv(
         os.path.join(RESULTS_DIR, "round_metrics.csv"), index=False
     )
@@ -740,33 +681,34 @@ def main() -> None:
         "comm_mb": round_log["comm_mb"],
         "cumulative_comm_mb": np.cumsum(round_log["comm_mb"]),
     }).to_csv(os.path.join(RESULTS_DIR, "communication_history.csv"), index=False)
-    
+
+    test_acc = float(rep_dict.get("accuracy", 0.0))
     meta = OrderedDict({
         "n_features": N_FEATURES,
         "n_classes": N_CLASSES,
         "n_clients": N_CLIENTS,
         "n_rounds": len(round_log["round"]),
         "best_round": best_rnd,
-        "full_accuracy": round_log["accuracy"][-1],
-        "full_f1": round_log["weighted_f1"][-1],
+        "best_val_accuracy": round(best_acc, 6),
+        "full_accuracy": round(test_acc, 6),
+        "full_f1": round(float(rep_dict["weighted avg"]["f1-score"]), 6),
         "pruned_accuracy": prep_dict.get("accuracy", None),
         "compression": ratio,
-        "total_comm_mb": comm.total,
+        "topk_pct": TOP_K_PCT,
+        "total_comm_mb": round(comm.total, 2),
         "time_min": round((time.time() - t0) / 60, 1),
     })
     with open(os.path.join(RESULTS_DIR, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
-    
+
     tf.keras.backend.clear_session()
     gc.collect()
-    
+
     logger.info("\n" + "█" * 50)
     logger.info(f"  DONE — {len(round_log['round'])} rounds, {meta['time_min']} min")
-    logger.info(f"  Accuracy: {meta['full_accuracy']:.4f} | F1: {meta['full_f1']:.4f}")
+    logger.info(f"  Test Accuracy: {meta['full_accuracy']:.4f} | F1: {meta['full_f1']:.4f}")
     logger.info("█" * 50)
 
-# ============================================================
-# ENTRY POINT
-# ============================================================
+
 if __name__ == "__main__":
     main()

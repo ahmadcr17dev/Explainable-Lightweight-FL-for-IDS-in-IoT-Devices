@@ -1,6 +1,7 @@
 # baselines.py
 
-import os, time, json, warnings, gc
+import os, sys, time, json, warnings, gc
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import tensorflow as tf
@@ -10,6 +11,34 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 warnings.filterwarnings('ignore')
 
+def _ensure_model_def_importable() -> None:
+    try:
+        import model_def  # noqa: F401
+        return
+    except ImportError:
+        pass
+    candidates = [
+        Path.cwd() / "model_def.py",
+        Path("/kaggle/working") / "model_def.py",
+        Path("/kaggle/working/code") / "model_def.py",
+    ]
+    if "__file__" in globals():
+        candidates.insert(0, Path(__file__).resolve().parent / "model_def.py")
+    input_root = Path("/kaggle/input")
+    if input_root.exists():
+        candidates.extend(sorted(input_root.rglob("model_def.py")))
+    for path in candidates:
+        if path.is_file():
+            parent = str(path.parent)
+            if parent not in sys.path:
+                sys.path.insert(0, parent)
+            return
+    raise ModuleNotFoundError(
+        "No module named 'model_def'. Upload model_def.py to /kaggle/working "
+        "or attach it as a Kaggle dataset."
+    )
+
+_ensure_model_def_importable()
 from model_def import build_lightweight_model
 
 # GPU memory growth
@@ -51,34 +80,47 @@ print("\n" + "="*55)
 print("BASELINE 1: Centralised Deep Model (GPU)")
 print("="*55)
 
+# Load class weights if available
+cw_path = os.path.join(PROC_DIR, "class_weights.json")
+class_weight = None
+if os.path.exists(cw_path):
+    with open(cw_path, "r") as f:
+        class_weight = {int(k): float(v) for k, v in json.load(f).items()}
+
 cb = baseline_model()
 print(f"Params: {cb.count_params():,}")
 
 t0 = time.time()
 cb.fit(
     X_train, y_train,
-    epochs=50,
-    batch_size=256,
+    epochs=40,
+    batch_size=512,
     validation_split=0.1,
+    class_weight=class_weight,
     verbose=1,
     callbacks=[
         tf.keras.callbacks.EarlyStopping(
-            patience=4,
+            patience=5,
             restore_best_weights=True,
-            monitor='val_accuracy'
+            monitor="val_accuracy",
+            mode="max",
         ),
         tf.keras.callbacks.ReduceLROnPlateau(
-            monitor='val_loss',
+            monitor="val_loss",
             factor=0.5,
             patience=2,
             min_lr=1e-6,
-            verbose=1
-        )
-    ]
+            verbose=1,
+        ),
+    ],
 )
 cb_time = time.time() - t0
 
-y_pred_cb = np.argmax(cb.predict(X_test, batch_size=1024, verbose=0), axis=1)
+def logits_to_pred(model, X):
+    logits = model.predict(X, batch_size=1024, verbose=0)
+    return np.argmax(logits, axis=1)
+
+y_pred_cb = logits_to_pred(cb, X_test)
 rep_cb    = classification_report(
     y_test, y_pred_cb,
     target_names=class_names,
@@ -221,8 +263,7 @@ if gpus:
 # final eval on test set
 sfl_m = baseline_model()
 sfl_m.set_weights(g_weights)
-y_pred_sfl = np.argmax(
-    sfl_m.predict(X_test, batch_size=1024, verbose=0), axis=1)
+y_pred_sfl = logits_to_pred(sfl_m, X_test)
 rep_sfl = classification_report(
     y_test, y_pred_sfl,
     target_names=class_names,

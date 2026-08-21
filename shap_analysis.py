@@ -121,12 +121,14 @@ model = tf.keras.models.load_model(
     os.path.join(RESULTS_DIR, "best_global_model.keras"),
     compile=False,
 )
+# Model outputs logits — compile with from_logits=True
 model.compile(
     optimizer="adam",
-    loss="sparse_categorical_crossentropy",
+    loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
     metrics=["accuracy"],
 )
 logger.info(f"Model input shape: {model.input_shape}")
+logger.info(f"Model output shape: {model.output_shape}")
 
 logger.info("Loading data...")
 X_test = np.load(os.path.join(PROC_DIR, "X_test.npy"))

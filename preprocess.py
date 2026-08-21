@@ -1,9 +1,3 @@
-"""
-Research-Grade Preprocessing Pipeline for CICIoT2023
-MEMORY-OPTIMISED: Peak RAM ≤ 18 GB
-Strategy: Sample → Feature Selection → Stream → Direct Write (25 cols only)
-"""
-
 import os
 import json
 import warnings
@@ -42,7 +36,7 @@ PROC_DIR = "/kaggle/working/processed"
 os.makedirs(PROC_DIR, exist_ok=True)
 
 LABEL_COL = "Label"
-TOP_FEATS = 25
+TOP_FEATS = 35
 TEST_SIZE = 0.2
 DTYPE = np.float32
 SAMPLE_FOR_MI = 200_000  # enough for MI estimation
@@ -50,6 +44,7 @@ CHUNK_SIZE = 30_000       # small chunks = low peak RAM
 
 # ============================================================
 # LABEL COLLAPSE MAPPING
+# Keys MUST be uppercase — apply normalize_label() before .map()
 # ============================================================
 COLLAPSE = OrderedDict({
     "DDOS-ICMP_FLOOD":          "DDoS-ICMP",
@@ -86,7 +81,13 @@ COLLAPSE = OrderedDict({
     "COMMANDINJECTION":         "Web_Attack",
     "UPLOADING_ATTACK":         "Web_Attack",
     "BENIGN":                   "Benign",
+    "BENIGNTRAFFIC":            "Benign",  # CICIoT2023 official name
 })
+
+
+def normalize_label(series):
+    """Uppercase + strip so mixed-case CICIoT labels match COLLAPSE keys."""
+    return series.astype(str).str.strip().str.upper().str.replace(" ", "", regex=False)
 
 
 def fmt_mem(nbytes):
@@ -125,6 +126,7 @@ logger.info(f"Numeric features: {n_total_features}")
 rng = np.random.RandomState(SEED)
 sample_X_list = []
 sample_y_list = []
+sample_counts = {}
 class_counts = {}
 total_rows = 0
 per_class_limit = max(1, SAMPLE_FOR_MI // 20)  # rough per-class cap for sample
@@ -135,8 +137,11 @@ for idx, fname in enumerate(files, 1):
         for chunk in pd.read_csv(fpath, chunksize=CHUNK_SIZE, low_memory=False):
             if LABEL_COL not in chunk.columns:
                 continue
-            # Collapse labels
-            chunk[LABEL_COL] = chunk[LABEL_COL].astype(str).str.strip().map(COLLAPSE)
+            # Collapse labels (uppercase first — CICIoT uses mixed case)
+            chunk[LABEL_COL] = normalize_label(chunk[LABEL_COL]).map(COLLAPSE)
+            unmapped = int(chunk[LABEL_COL].isna().sum())
+            if unmapped:
+                logger.warning(f"  Dropping {unmapped} rows with unmapped labels in {fname}")
             chunk = chunk.dropna(subset=[LABEL_COL])
             if len(chunk) == 0:
                 continue
@@ -148,17 +153,20 @@ for idx, fname in enumerate(files, 1):
             for lbl in y_str:
                 class_counts[lbl] = class_counts.get(lbl, 0) + 1
 
-            # Collect sample rows for MI (stratified per class)
+            # Collect sample rows for MI (cap per class)
             for lbl in np.unique(y_str):
-                if class_counts.get(lbl, 0) <= per_class_limit:
-                    mask = (y_str == lbl)
-                    take = min(per_class_limit, mask.sum())
-                    indices = np.where(mask)[0]
-                    if len(indices) > 0:
-                        sel = rng.choice(indices, size=min(take, len(indices)), replace=False)
-                        X_sel = chunk[numeric_cols].iloc[sel].values.astype(DTYPE)
-                        sample_X_list.append(X_sel)
-                        sample_y_list.extend([lbl] * len(sel))
+                already = sample_counts.get(lbl, 0)
+                if already >= per_class_limit:
+                    continue
+                mask = (y_str == lbl)
+                indices = np.where(mask)[0]
+                need = min(per_class_limit - already, len(indices))
+                if need > 0:
+                    sel = rng.choice(indices, size=need, replace=False)
+                    X_sel = chunk[numeric_cols].iloc[sel].values.astype(DTYPE)
+                    sample_X_list.append(X_sel)
+                    sample_y_list.extend([lbl] * len(sel))
+                    sample_counts[lbl] = already + len(sel)
 
             del chunk
             gc.collect()
@@ -237,7 +245,7 @@ gc.collect()
 # PHASE 3 — STREAMING LOAD → DIRECT WRITE (25 COLS ONLY)
 # ============================================================
 logger.info("=" * 60)
-logger.info(" PHASE 3 — STREAMING → TRAIN/TEST (25 features)")
+logger.info(f" PHASE 3 — STREAMING → TRAIN/TEST ({TOP_FEATS} features)")
 logger.info("=" * 60)
 
 # Compute per-class train/test targets
@@ -257,7 +265,7 @@ n_train_total = int(train_target.sum())
 n_test_total = int(test_target.sum())
 logger.info(f"Train: {n_train_total:,}  |  Test: {n_test_total:,}")
 
-# Pre-allocate arrays for 25 FEATURES ONLY
+# Pre-allocate arrays for selected features only
 X_train = np.zeros((n_train_total, TOP_FEATS), dtype=DTYPE)
 y_train = np.zeros(n_train_total, dtype=np.int32)
 X_test = np.zeros((n_test_total, TOP_FEATS), dtype=DTYPE)
@@ -294,13 +302,13 @@ for idx, fname in enumerate(files, 1):
         for chunk in pd.read_csv(fpath, chunksize=CHUNK_SIZE, low_memory=False):
             if LABEL_COL not in chunk.columns:
                 continue
-            chunk[LABEL_COL] = chunk[LABEL_COL].astype(str).str.strip().map(COLLAPSE)
+            chunk[LABEL_COL] = normalize_label(chunk[LABEL_COL]).map(COLLAPSE)
             chunk = chunk.dropna(subset=[LABEL_COL])
             if len(chunk) == 0:
                 continue
 
             y_enc = label_encoder.transform(chunk[LABEL_COL].values).astype(np.int32)
-            X_chunk = chunk[selected_features].values.astype(DTYPE)  # ONLY 25 COLS
+            X_chunk = chunk[selected_features].values.astype(DTYPE)  # selected cols only
             del chunk
             gc.collect()
 
@@ -308,9 +316,10 @@ for idx, fname in enumerate(files, 1):
             X_chunk = np.where(np.isinf(X_chunk), np.nan, X_chunk)
             col_med = np.nanmedian(X_chunk, axis=0)
             nm = np.isnan(X_chunk)
-            for ci in range(TOP_FEATS):
+            for ci in range(X_chunk.shape[1]):
                 if nm[:, ci].any():
-                    X_chunk[nm[:, ci], ci] = col_med[ci]
+                    fill = col_med[ci] if not np.isnan(col_med[ci]) else 0.0
+                    X_chunk[nm[:, ci], ci] = fill
 
             # Shuffle
             perm = rng.permutation(len(X_chunk))
@@ -413,10 +422,13 @@ pd.DataFrame({
     "test_count": [test_dist.get(i, 0) for i in range(n_classes)],
 }).to_csv(os.path.join(PROC_DIR, "class_distribution.csv"), index=False)
 
-cw = compute_class_weight("balanced", classes=np.unique(y_train), y=y_train)
-cw_dict = {int(k): round(float(v), 6) for k, v in enumerate(cw)}
+cw = compute_class_weight("balanced", classes=np.arange(n_classes), y=y_train)
+# Cap extreme weights — rare classes otherwise destabilise CE training
+cw = np.clip(cw, 0.5, 8.0)
+cw_dict = {int(i): round(float(cw[i]), 6) for i in range(n_classes)}
 with open(os.path.join(PROC_DIR, "class_weights.json"), "w") as f:
     json.dump(cw_dict, f, indent=2)
+logger.info(f"Class weights (clipped): {cw_dict}")
 
 # ============================================================
 # PHASE 6 — SAVE
