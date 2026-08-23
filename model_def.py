@@ -121,12 +121,13 @@ def build_lightweight_model(
     n_classes,
     total_steps=10000,
     learning_rate=3e-4,
-    weight_decay=1e-4,
+    weight_decay=1e-5,
     clipnorm=1.0,
 ):
     """
     Lightweight MLP that outputs LOGITS (no softmax).
     Train / compile with from_logits=True.
+    Tuned for tabular CICIoT: wider + milder dropout.
     """
     inp = layers.Input(shape=(n_features,), name="features")
 
@@ -137,7 +138,7 @@ def build_lightweight_model(
     )(inp)
     x = _leaky_relu()(x)
     x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.25)(x)
+    x = layers.Dropout(0.15)(x)
 
     x = layers.Dense(
         128,
@@ -146,7 +147,7 @@ def build_lightweight_model(
     )(x)
     x = _leaky_relu()(x)
     x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.20)(x)
+    x = layers.Dropout(0.10)(x)
 
     x = layers.Dense(
         64,
@@ -155,9 +156,7 @@ def build_lightweight_model(
     )(x)
     x = _leaky_relu()(x)
     x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.10)(x)
 
-    # Logits in float32 — required under mixed_float16 for stable CE
     out = layers.Dense(n_classes, activation=None, dtype="float32", name="logits")(x)
     model = models.Model(inputs=inp, outputs=out, name="lightweight_mlp")
 
@@ -190,9 +189,9 @@ def apply_magnitude_pruning(model, sparsity=0.40, compile_after=True):
 
 
 def build_and_test_model():
-    model = build_lightweight_model(n_features=35, n_classes=16, total_steps=10000)
+    model = build_lightweight_model(n_features=46, n_classes=12, total_steps=10000)
     model.summary(print_fn=lambda s: print(s))
-    x = np.zeros((2, 35), dtype=np.float32)
+    x = np.zeros((2, 46), dtype=np.float32)
     y = model.predict(x, verbose=0)
     print(f"Model test output shape: {y.shape} (logits)")
     return model

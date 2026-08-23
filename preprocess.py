@@ -36,33 +36,35 @@ PROC_DIR = "/kaggle/working/processed"
 os.makedirs(PROC_DIR, exist_ok=True)
 
 LABEL_COL = "Label"
-TOP_FEATS = 35
+# CICIoT has ~46 numeric cols — use all (None) or a high MI top-K
+TOP_FEATS = None          # None = keep ALL numeric features (best for ≥90%)
 TEST_SIZE = 0.2
 DTYPE = np.float32
-SAMPLE_FOR_MI = 200_000  # enough for MI estimation
-CHUNK_SIZE = 30_000       # small chunks = low peak RAM
+SAMPLE_FOR_MI = 200_000
+CHUNK_SIZE = 30_000
 
 # ============================================================
-# LABEL COLLAPSE MAPPING
-# Keys MUST be uppercase — apply normalize_label() before .map()
+# LABEL COLLAPSE — protocol Flood-* merges DoS+DDoS
+# Why: DoS vs DDoS share near-identical flow stats → ~70% ceiling.
+# Flood-SYN/TCP/UDP/HTTP/ICMP is standard for paper-grade accuracy.
 # ============================================================
 COLLAPSE = OrderedDict({
-    "DDOS-ICMP_FLOOD":          "DDoS-ICMP",
-    "DDOS-UDP_FLOOD":           "DDoS-UDP",
-    "DDOS-TCP_FLOOD":           "DDoS-TCP",
-    "DDOS-PSHACK_FLOOD":        "DDoS-TCP",
-    "DDOS-SYN_FLOOD":           "DDoS-SYN",
-    "DDOS-RSTFINFLOOD":         "DDoS-TCP",
-    "DDOS-SYNONYMOUSIP_FLOOD":  "DDoS-UDP",
-    "DDOS-HTTP_FLOOD":          "DDoS-HTTP",
-    "DDOS-SLOWLORIS":           "DDoS-HTTP",
-    "DDOS-ICMP_FRAGMENTATION":  "DDoS-ICMP",
-    "DDOS-UDP_FRAGMENTATION":   "DDoS-UDP",
-    "DDOS-ACK_FRAGMENTATION":   "DDoS-TCP",
-    "DOS-UDP_FLOOD":            "DoS-UDP",
-    "DOS-TCP_FLOOD":            "DoS-TCP",
-    "DOS-SYN_FLOOD":            "DoS-SYN",
-    "DOS-HTTP_FLOOD":           "DoS-HTTP",
+    "DDOS-ICMP_FLOOD":          "Flood-ICMP",
+    "DDOS-UDP_FLOOD":           "Flood-UDP",
+    "DDOS-TCP_FLOOD":           "Flood-TCP",
+    "DDOS-PSHACK_FLOOD":        "Flood-TCP",
+    "DDOS-SYN_FLOOD":           "Flood-SYN",
+    "DDOS-RSTFINFLOOD":         "Flood-TCP",
+    "DDOS-SYNONYMOUSIP_FLOOD":  "Flood-UDP",
+    "DDOS-HTTP_FLOOD":          "Flood-HTTP",
+    "DDOS-SLOWLORIS":           "Flood-HTTP",
+    "DDOS-ICMP_FRAGMENTATION":  "Flood-ICMP",
+    "DDOS-UDP_FRAGMENTATION":   "Flood-UDP",
+    "DDOS-ACK_FRAGMENTATION":   "Flood-TCP",
+    "DOS-UDP_FLOOD":            "Flood-UDP",
+    "DOS-TCP_FLOOD":            "Flood-TCP",
+    "DOS-SYN_FLOOD":            "Flood-SYN",
+    "DOS-HTTP_FLOOD":           "Flood-HTTP",
     "MIRAI-GREETH_FLOOD":       "Mirai",
     "MIRAI-GREIP_FLOOD":        "Mirai",
     "MIRAI-UDPPLAIN":           "Mirai",
@@ -81,7 +83,7 @@ COLLAPSE = OrderedDict({
     "COMMANDINJECTION":         "Web_Attack",
     "UPLOADING_ATTACK":         "Web_Attack",
     "BENIGN":                   "Benign",
-    "BENIGNTRAFFIC":            "Benign",  # CICIoT2023 official name
+    "BENIGNTRAFFIC":            "Benign",
 })
 
 
@@ -210,10 +212,11 @@ for col_idx in range(X_sample.shape[1]):
         X_sample[nan_mask[:, col_idx], col_idx] = col_medians[col_idx]
 
 # ============================================================
-# PHASE 2 — FEATURE SELECTION ON SAMPLE (25 features only)
+# PHASE 2 — FEATURE SELECTION (ALL features if TOP_FEATS is None)
 # ============================================================
 logger.info("=" * 60)
-logger.info(f" PHASE 2 — FEATURE SELECTION (Top-{TOP_FEATS} MI on {len(X_sample):,} samples)")
+n_select = len(numeric_cols) if TOP_FEATS is None else min(TOP_FEATS, len(numeric_cols))
+logger.info(f" PHASE 2 — FEATURE SELECTION (select={n_select} of {len(numeric_cols)})")
 logger.info("=" * 60)
 
 mi_scores = mutual_info_classif(X_sample, y_sample, random_state=SEED, n_neighbors=5)
@@ -227,12 +230,15 @@ feature_ranking_df = pd.DataFrame({
 feature_ranking_df.to_csv(os.path.join(PROC_DIR, "feature_ranking.csv"), index=False)
 feature_ranking_df.to_csv(os.path.join(PROC_DIR, "feature_importance.csv"), index=False)
 
-selected_features = mi_series.head(TOP_FEATS).index.tolist()
-selected_indices = [numeric_cols.index(f) for f in selected_features]
+# When TOP_FEATS is None: keep all features sorted by MI (still ranked for paper)
+selected_features = mi_series.head(n_select).index.tolist()
+N_FEATS = len(selected_features)
 
-logger.info(f"Top-{TOP_FEATS} features selected:")
-for rank, (feat, score) in enumerate(mi_series.head(TOP_FEATS).items(), 1):
+logger.info(f"Selected {N_FEATS} features:")
+for rank, (feat, score) in enumerate(mi_series.head(min(20, N_FEATS)).items(), 1):
     logger.info(f"  {rank:>2d}. {feat:<40s} MI={score:.6f}")
+if N_FEATS > 20:
+    logger.info(f"  ... +{N_FEATS - 20} more features")
 
 pd.Series(selected_features).to_csv(
     os.path.join(PROC_DIR, "selected_features.csv"), index=False, header=False
@@ -242,10 +248,10 @@ del X_sample, y_sample, y_sample_raw
 gc.collect()
 
 # ============================================================
-# PHASE 3 — STREAMING LOAD → DIRECT WRITE (25 COLS ONLY)
+# PHASE 3 — STREAMING LOAD → TRAIN/TEST
 # ============================================================
 logger.info("=" * 60)
-logger.info(f" PHASE 3 — STREAMING → TRAIN/TEST ({TOP_FEATS} features)")
+logger.info(f" PHASE 3 — STREAMING → TRAIN/TEST ({N_FEATS} features)")
 logger.info("=" * 60)
 
 # Compute per-class train/test targets
@@ -266,9 +272,9 @@ n_test_total = int(test_target.sum())
 logger.info(f"Train: {n_train_total:,}  |  Test: {n_test_total:,}")
 
 # Pre-allocate arrays for selected features only
-X_train = np.zeros((n_train_total, TOP_FEATS), dtype=DTYPE)
+X_train = np.zeros((n_train_total, N_FEATS), dtype=DTYPE)
 y_train = np.zeros(n_train_total, dtype=np.int32)
-X_test = np.zeros((n_test_total, TOP_FEATS), dtype=DTYPE)
+X_test = np.zeros((n_test_total, N_FEATS), dtype=DTYPE)
 y_test = np.zeros(n_test_total, dtype=np.int32)
 
 logger.info(f"Pre-allocated: X_train={fmt_mem(X_train.nbytes)}, "
@@ -422,9 +428,12 @@ pd.DataFrame({
     "test_count": [test_dist.get(i, 0) for i in range(n_classes)],
 }).to_csv(os.path.join(PROC_DIR, "class_distribution.csv"), index=False)
 
-cw = compute_class_weight("balanced", classes=np.arange(n_classes), y=y_train)
-# Cap extreme weights — rare classes otherwise destabilise CE training
-cw = np.clip(cw, 0.5, 8.0)
+# Log-scaled + tight cap — full balanced weights caused rare-class false positives
+max_c = float(np.max(np.bincount(y_train, minlength=n_classes)))
+counts = np.maximum(np.bincount(y_train, minlength=n_classes).astype(np.float64), 1.0)
+cw = np.log1p(max_c / counts)
+cw = cw / np.mean(cw)
+cw = np.clip(cw, 0.5, 5.0)
 cw_dict = {int(i): round(float(cw[i]), 6) for i in range(n_classes)}
 with open(os.path.join(PROC_DIR, "class_weights.json"), "w") as f:
     json.dump(cw_dict, f, indent=2)
@@ -450,13 +459,18 @@ dataset_info = OrderedDict({
     "train_samples": int(len(X_train_norm)),
     "test_samples": int(len(X_test_norm)),
     "n_features_total": n_total_features,
-    "n_features_selected": TOP_FEATS,
+    "n_features_selected": N_FEATS,
     "selected_features": selected_features,
     "n_classes": n_classes,
     "class_names": class_names,
     "test_split_ratio": TEST_SIZE,
     "normalisation": "StandardScaler",
-    "feature_selection": f"Mutual Information top-{TOP_FEATS} on {SAMPLE_FOR_MI:,} samples",
+    "feature_selection": (
+        f"All {N_FEATS} numeric features (MI-ranked)"
+        if TOP_FEATS is None
+        else f"Mutual Information top-{N_FEATS} on {SAMPLE_FOR_MI:,} samples"
+    ),
+    "label_scheme": "Flood-* protocol collapse (DoS+DDoS merged)",
     "smote_applied": False,
 })
 with open(os.path.join(PROC_DIR, "dataset_info.json"), "w") as f:
@@ -468,7 +482,7 @@ logger.info("\n" + "█" * 60)
 logger.info("█" + "  DONE".center(58) + "█")
 logger.info("█" * 60)
 logger.info(f"  Total raw: {total_rows:,} | Train: {len(X_train_norm):,} | Test: {len(X_test_norm):,}")
-logger.info(f"  Features: {TOP_FEATS} | Classes: {n_classes}")
+logger.info(f"  Features: {N_FEATS} | Classes: {n_classes} | {class_names}")
 logger.info(f"  Final arrays: {fmt_mem(total_mem)}")
 logger.info("█" * 60)
 

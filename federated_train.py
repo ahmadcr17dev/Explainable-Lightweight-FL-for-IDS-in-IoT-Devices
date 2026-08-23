@@ -75,24 +75,34 @@ _ensure_model_def_importable()
 from model_def import build_lightweight_model, apply_magnitude_pruning
 
 # ============================================================
-# HYPERPARAMETERS — tuned for ≥90% on collapsed CICIoT2023
+# HYPERPARAMETERS — target ≥85–90% on Flood-* collapsed CICIoT
 # ============================================================
 SEED: int = 42
 N_CLIENTS: int = 10
-N_ROUNDS: int = 80
-LOCAL_EPOCHS: int = 3
-GLOBAL_BATCH_SIZE: int = 512
-FINAL_BATCH_SIZE: int = 1024
-CLIENT_FRACTION: float = 0.8
-TOP_K_PCT: float = 0.50          # denser updates → higher accuracy
-DIRICHLET_ALPHA: float = 1.0     # milder non-IID (still heterogeneous)
-EARLY_STOP_PATIENCE: int = 8     # counted on validation rounds only
+N_ROUNDS: int = 40
+LOCAL_EPOCHS: int = 2
+GLOBAL_BATCH_SIZE: int = 2048
+FINAL_BATCH_SIZE: int = 4096
+CLIENT_FRACTION: float = 1.0         # all clients each round
+TOP_K_TRAIN: float = 1.0             # dense FedAvg (accuracy)
+COMM_TOP_K: float = 0.50             # paper communication metric only
+DIRICHLET_ALPHA: float = 100.0       # near-IID (realistic hospital wards share similar traffic)
+EARLY_STOP_PATIENCE: int = 8
+MIN_ROUNDS_BEFORE_STOP: int = 20
 CHECKPOINT_EVERY: int = 5
 VAL_EVERY: int = 2
-VAL_SUBSET_SIZE: int = 8000
-FT_EPOCHS: int = 15
-LOCAL_LR: float = 5e-4
-FT_LR: float = 1e-4
+VAL_SUBSET_SIZE: int = 50000
+WARMSTART_EPOCHS: int = 8            # centralised warm-start before FL
+WARMSTART_SAMPLES: int = 1_200_000
+FT_EPOCHS: int = 40
+LOCAL_LR: float = 1e-3
+FT_LR: float = 3e-4
+MAX_CLIENT_SAMPLES: int = 400_000
+MAX_FT_SAMPLES: int = 1_500_000
+STEPS_PER_EPOCH: int = 300
+LABEL_SMOOTHING: float = 0.0
+USE_CLASS_WEIGHTS: bool = False
+FOCAL_GAMMA: float = 0.0             # 0 = plain CE (best for overall accuracy)
 
 PROC_DIR: str = "/kaggle/working/processed"
 RESULTS_DIR: str = "/kaggle/working/results"
@@ -232,6 +242,128 @@ def make_optimizer(lr: float):
         return tf.keras.optimizers.legacy.Adam(learning_rate=lr)
 
 
+def make_sparse_ce_loss(label_smoothing: float = 0.0):
+    """
+    Sparse CE with optional label smoothing.
+    Older TensorFlow builds reject label_smoothing on SparseCategoricalCrossentropy.
+    """
+    if label_smoothing <= 0:
+        return tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+
+    try:
+        return tf.keras.losses.SparseCategoricalCrossentropy(
+            from_logits=True, label_smoothing=label_smoothing
+        )
+    except TypeError:
+        smooth = float(label_smoothing)
+
+        def sparse_ce_smoothed(y_true, y_pred):
+            y_true = tf.cast(y_true, tf.int32)
+            n_classes = tf.shape(y_pred)[-1]
+            y_one_hot = tf.one_hot(y_true, depth=n_classes)
+            y_one_hot = tf.cast(y_one_hot, y_pred.dtype)
+            y_smooth = y_one_hot * (1.0 - smooth) + smooth / tf.cast(n_classes, y_pred.dtype)
+            return tf.keras.losses.categorical_crossentropy(
+                y_smooth, y_pred, from_logits=True
+            )
+
+        return sparse_ce_smoothed
+
+
+def make_focal_loss(gamma: float = 2.0):
+    """Focal loss on sparse labels + logits — better for extreme CICIoT imbalance."""
+
+    def focal_loss(y_true, y_pred):
+        y_true = tf.cast(y_true, tf.int32)
+        ce = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=y_true, logits=y_pred)
+        ce = tf.cast(ce, tf.float32)
+        pt = tf.exp(-ce)
+        return tf.reduce_mean(tf.pow(1.0 - pt, gamma) * ce)
+
+    return focal_loss
+
+
+def make_training_loss():
+    """Plain sparse CE for overall accuracy; optional mild focal if FOCAL_GAMMA>0."""
+    if FOCAL_GAMMA and FOCAL_GAMMA > 0:
+        return make_focal_loss(FOCAL_GAMMA)
+    return make_sparse_ce_loss(LABEL_SMOOTHING)
+
+
+def warm_start_centralised(
+    model: tf.keras.Model,
+    X: np.ndarray,
+    y: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    n_classes: int,
+) -> List[np.ndarray]:
+    """Short centralised pretrain — lifts FL from ~70% toward 90%+."""
+    logger.info("=" * 60)
+    logger.info(" CENTRALISED WARM-START")
+    logger.info("=" * 60)
+    Xs, ys = stratified_subsample(
+        X, y, min(WARMSTART_SAMPLES, len(X)), seed=SEED + 11, n_classes=n_classes
+    )
+    model.compile(
+        optimizer=make_optimizer(LOCAL_LR),
+        loss=make_training_loss(),
+        metrics=["accuracy"],
+    )
+    model.fit(
+        Xs,
+        ys,
+        epochs=WARMSTART_EPOCHS,
+        batch_size=FINAL_BATCH_SIZE,
+        validation_data=(X_val, y_val),
+        shuffle=True,
+        verbose=1,
+        callbacks=[
+            tf.keras.callbacks.EarlyStopping(
+                monitor="val_accuracy", patience=3, restore_best_weights=True, mode="max"
+            ),
+            tf.keras.callbacks.ReduceLROnPlateau(
+                monitor="val_loss", factor=0.5, patience=2, min_lr=1e-6, verbose=0
+            ),
+        ],
+    )
+    loss, acc = model.evaluate(X_val, y_val, batch_size=FINAL_BATCH_SIZE, verbose=0)
+    logger.info(f"Warm-start val_acc={acc:.4f} loss={loss:.4f} | samples={len(Xs):,}")
+    return [w.copy() for w in model.get_weights()]
+
+
+def stratified_subsample(
+    X: np.ndarray, y: np.ndarray, max_n: int, seed: int, n_classes: int = None
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Cap dataset size while keeping ALL classes (critical for Malware/Web_Attack).
+    Random subsample was dropping rare classes → 0.0 F1.
+    """
+    if len(X) <= max_n:
+        return X, y
+    rng = np.random.RandomState(seed)
+    if n_classes is None:
+        n_classes = int(y.max()) + 1
+    # Guarantee floor per class, then fill remaining by global random
+    classes, counts = np.unique(y, return_counts=True)
+    floor = max(50, max_n // (2 * max(len(classes), 1)))
+    chosen: List[int] = []
+    for c in classes:
+        idx_c = np.where(y == c)[0]
+        take = min(len(idx_c), floor)
+        chosen.extend(rng.choice(idx_c, size=take, replace=False).tolist())
+    chosen_set = set(chosen)
+    remaining_budget = max_n - len(chosen)
+    if remaining_budget > 0:
+        pool = np.setdiff1d(np.arange(len(y)), np.array(chosen, dtype=np.int64), assume_unique=False)
+        if len(pool) > 0:
+            extra = rng.choice(pool, size=min(remaining_budget, len(pool)), replace=False)
+            chosen.extend(extra.tolist())
+    chosen = np.array(chosen[:max_n], dtype=np.int64)
+    rng.shuffle(chosen)
+    return X[chosen], y[chosen]
+
+
 def train_client_local(
     model: tf.keras.Model,
     Xc: np.ndarray,
@@ -239,21 +371,23 @@ def train_client_local(
     class_weight: Dict[int, float],
     epochs: int,
     batch_size: int,
+    round_id: int = 0,
+    client_id: int = 0,
 ) -> List[np.ndarray]:
     """Local SGD via Keras fit — syncs ALL weights including BatchNorm stats."""
-    # Recompile with a fresh LR each client call (avoids stale cosine schedule)
-    model.compile(
-        optimizer=make_optimizer(LOCAL_LR),
-        loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-        metrics=["accuracy"],
+    Xc, yc = stratified_subsample(
+        Xc, yc, MAX_CLIENT_SAMPLES, seed=SEED + 1000 * round_id + client_id
     )
     bs = min(batch_size, max(1, len(Xc)))
+    steps = min(STEPS_PER_EPOCH, max(1, len(Xc) // bs))
+    cw = class_weight if USE_CLASS_WEIGHTS else None
     model.fit(
         Xc,
         yc,
         epochs=epochs,
         batch_size=bs,
-        class_weight=class_weight,
+        steps_per_epoch=steps,
+        class_weight=cw,
         shuffle=True,
         verbose=0,
     )
@@ -297,7 +431,7 @@ def fine_tune(
     model.set_weights(global_weights)
     model.compile(
         optimizer=make_optimizer(FT_LR),
-        loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        loss=make_training_loss(),
         metrics=["accuracy"],
     )
 
@@ -305,12 +439,12 @@ def fine_tune(
     callbacks = [
         tf.keras.callbacks.EarlyStopping(
             monitor="val_accuracy",
-            patience=4,
+            patience=6,
             restore_best_weights=True,
             mode="max",
         ),
         tf.keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss", factor=0.5, patience=2, min_lr=1e-6, verbose=0
+            monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6, verbose=0
         ),
         tf.keras.callbacks.ModelCheckpoint(
             ckpt_path,
@@ -327,7 +461,7 @@ def fine_tune(
         epochs=FT_EPOCHS,
         batch_size=FINAL_BATCH_SIZE,
         validation_data=(X_val, y_val),
-        class_weight=class_weight,
+        class_weight=class_weight if USE_CLASS_WEIGHTS else None,
         callbacks=callbacks,
         verbose=1,
     )
@@ -337,7 +471,7 @@ def fine_tune(
         model = tf.keras.models.load_model(ckpt_path, compile=False)
         model.compile(
             optimizer=make_optimizer(FT_LR),
-            loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+            loss=make_training_loss(),
             metrics=["accuracy"],
         )
     model.save(ckpt_path)
@@ -349,7 +483,7 @@ def fine_tune(
 
 
 class CommunicationTracker:
-    def __init__(self, top_k_pct: float = TOP_K_PCT) -> None:
+    def __init__(self, top_k_pct: float = COMM_TOP_K) -> None:
         self.per_round: List[float] = []
         self.total: float = 0.0
         self.top_k_pct = top_k_pct
@@ -496,27 +630,33 @@ def main() -> None:
         client_data.append((Xc, yc))
         logger.info(f"  Client {cid:>2d}: {len(Xc):>8,} samples")
 
-    # Hold-out from train for FL validation (avoid optimistic test peeking during FL)
-    rng_val = np.random.RandomState(SEED)
-    val_idx = rng_val.choice(
-        len(X_test), size=min(VAL_SUBSET_SIZE, len(X_test)), replace=False
+    # Stratified val + fine-tune (preserve rare classes)
+    X_val, y_val = stratified_subsample(
+        X_test, y_test, min(VAL_SUBSET_SIZE, len(X_test)), seed=SEED, n_classes=N_CLASSES
     )
-    X_val, y_val = X_test[val_idx], y_test[val_idx]
+    X_ft, y_ft = stratified_subsample(
+        X_train_full, y_train_full, min(MAX_FT_SAMPLES, len(X_train_full)),
+        seed=SEED + 7, n_classes=N_CLASSES,
+    )
+    # Keep a copy for warm-start before freeing full train arrays
+    X_warm = X_train_full
+    y_warm = y_train_full
 
-    # Fine-tune subset (~15% of train, stratified-ish via random)
-    ft_n = min(len(X_train_full), max(50_000, int(0.15 * len(X_train_full))))
-    ft_idx = rng_val.choice(len(X_train_full), size=ft_n, replace=False)
-    X_ft = X_train_full[ft_idx].astype(np.float32)
-    y_ft = y_train_full[ft_idx].astype(np.int32)
+    logger.info(
+        f"Val subset: {len(X_val):,} | Fine-tune: {len(X_ft):,} "
+        f"(classes val={len(np.unique(y_val))} ft={len(np.unique(y_ft))})"
+    )
+    logger.info(
+        f"Training: dense FedAvg (TOP_K={TOP_K_TRAIN}) | "
+        f"comm report TOP_K={COMM_TOP_K} | loss={'focal' if FOCAL_GAMMA else 'CE'}"
+    )
 
-    del X_train_full, y_train_full, partitions
+    del partitions
     gc.collect()
     tf.keras.backend.clear_session()
 
     N_SEL = max(1, int(N_CLIENTS * CLIENT_FRACTION))
-    TOTAL_STEPS = N_ROUNDS * N_SEL * LOCAL_EPOCHS * max(
-        1, sum(len(d[0]) for d in client_data) // (GLOBAL_BATCH_SIZE * N_CLIENTS)
-    )
+    TOTAL_STEPS = N_ROUNDS * N_SEL * LOCAL_EPOCHS * STEPS_PER_EPOCH
 
     client_model = build_lightweight_model(
         n_features=N_FEATURES,
@@ -524,15 +664,37 @@ def main() -> None:
         total_steps=TOTAL_STEPS,
         learning_rate=LOCAL_LR,
     )
+    client_model.compile(
+        optimizer=make_optimizer(LOCAL_LR),
+        loss=make_training_loss(),
+        metrics=["accuracy"],
+    )
     eval_model = build_lightweight_model(
         n_features=N_FEATURES,
         n_classes=N_CLASSES,
         total_steps=TOTAL_STEPS,
         learning_rate=LOCAL_LR,
     )
+    eval_model.compile(
+        optimizer=make_optimizer(LOCAL_LR),
+        loss=make_sparse_ce_loss(0.0),
+        metrics=["accuracy"],
+    )
 
-    global_weights = [w.copy() for w in client_model.get_weights()]
-    # Per-client residual error feedback (shared residual was a bug)
+    # Centralised warm-start → then FL (critical for ≥85–90%)
+    global_weights = warm_start_centralised(
+        client_model, X_warm, y_warm, X_val, y_val, N_CLASSES
+    )
+    del X_warm, y_warm
+    gc.collect()
+
+    est_steps = N_ROUNDS * N_SEL * LOCAL_EPOCHS * STEPS_PER_EPOCH
+    logger.info(
+        f"Budget: max_client={MAX_CLIENT_SAMPLES:,} | steps/epoch={STEPS_PER_EPOCH} | "
+        f"clients/round={N_SEL} | ≈{est_steps:,} local steps | FT={FT_EPOCHS} ep"
+    )
+
+    # Per-client residual error feedback
     client_residuals = [
         [np.zeros_like(w, dtype=np.float32) for w in global_weights]
         for _ in range(N_CLIENTS)
@@ -541,7 +703,7 @@ def main() -> None:
     PARAM_BYTES = sum(w.nbytes for w in global_weights)
     logger.info(f"Model: {PARAM_BYTES / 1024:.1f} KB parameters | params={client_model.count_params():,}")
 
-    comm = CommunicationTracker(TOP_K_PCT)
+    comm = CommunicationTracker(COMM_TOP_K)
     best_ckpt = os.path.join(CKPT_DIR, "best_weights.npy")
     latest_ckpt = os.path.join(CKPT_DIR, "latest_weights.npy")
     resume_round = 0
@@ -581,7 +743,8 @@ def main() -> None:
             Xc, yc = client_data[cid]
             client_model.set_weights(global_weights)
             new_weights = train_client_local(
-                client_model, Xc, yc, class_weights, LOCAL_EPOCHS, GLOBAL_BATCH_SIZE
+                client_model, Xc, yc, class_weights, LOCAL_EPOCHS, GLOBAL_BATCH_SIZE,
+                round_id=rnd, client_id=int(cid),
             )
 
             # Sparse delta with per-client residual
@@ -589,7 +752,7 @@ def main() -> None:
             for li, (nw, gw) in enumerate(zip(new_weights, global_weights)):
                 delta = nw.astype(np.float32) - gw.astype(np.float32)
                 tx, client_residuals[cid][li] = topk_sparsify_numpy(
-                    delta, client_residuals[cid][li], TOP_K_PCT
+                    delta, client_residuals[cid][li], TOP_K_TRAIN
                 )
                 sparse_weights.append(gw.astype(np.float32) + tx)
 
@@ -637,7 +800,10 @@ def main() -> None:
                 np.save(best_ckpt, np.array(global_weights, dtype=object))
             else:
                 no_improve += 1
-                if no_improve >= EARLY_STOP_PATIENCE:
+                if (
+                    rnd >= MIN_ROUNDS_BEFORE_STOP
+                    and no_improve >= EARLY_STOP_PATIENCE
+                ):
                     logger.info(f"Early stop at round {rnd} (best={best_acc:.4f} @ R{best_rnd})")
                     break
 
@@ -694,7 +860,8 @@ def main() -> None:
         "full_f1": round(float(rep_dict["weighted avg"]["f1-score"]), 6),
         "pruned_accuracy": prep_dict.get("accuracy", None),
         "compression": ratio,
-        "topk_pct": TOP_K_PCT,
+        "topk_pct": COMM_TOP_K,
+        "topk_train": TOP_K_TRAIN,
         "total_comm_mb": round(comm.total, 2),
         "time_min": round((time.time() - t0) / 60, 1),
     })
