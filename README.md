@@ -1,9 +1,11 @@
-# Explainable Lightweight Federated Learning-Based Intrusion Detection System for IoMT
+# Lightweight Explainable Federated Learning for Intrusion Detection in Resource-Constrained IoT Devices: An Empirical Evaluation
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)]()
 [![TensorFlow](https://img.shields.io/badge/TensorFlow-2.x-orange.svg)]()
 [![Dataset](https://img.shields.io/badge/Dataset-CICIoT2023-purple.svg)]()
 [![License](https://img.shields.io/badge/License-MIT-green.svg)]()
+
+**Paper:** *Lightweight Explainable Federated Learning for Intrusion Detection in Resource-Constrained IoT Devices: An Empirical Evaluation*
 
 **Repository:** [Explainable-IDS-in-IOMT-using-FL](https://github.com/ahmadcr17dev/Explainable-IDS-in-IOMT-using-FL)
 
@@ -11,9 +13,9 @@
 
 ## Overview
 
-Internet of Medical Things (IoMT) devices expand the attack surface of healthcare networks while producing highly sensitive traffic. Centralised intrusion detection requires shipping raw flows to a single server, which raises privacy, bandwidth, and regulatory concerns.
+Resource-constrained Internet of Things (IoT) and Internet of Medical Things (IoMT) devices expand the attack surface of networked systems while producing highly sensitive traffic. Centralised intrusion detection requires shipping raw flows to a single server, which raises privacy, bandwidth, and regulatory concerns.
 
-This project implements a **privacy-preserving lightweight Federated Learning Intrusion Detection System (FL-IDS)** for IoMT, evaluated on the **CICIoT2023** benchmark.
+This repository contains the code for the empirical evaluation of a **privacy-preserving lightweight Federated Learning Intrusion Detection System (FL-IDS)** for resource-constrained IoT/IoMT environments, evaluated on the **CICIoT2023** benchmark.
 
 The framework combines:
 
@@ -242,7 +244,7 @@ Expected headline range for the proposed method: **≥ 0.85–0.90** (this run: 
 
 ## Research Motivation
 
-The framework targets three IoMT security challenges at once:
+The framework targets three security challenges for resource-constrained IoT/IoMT devices at once:
 
 1. **Privacy** — federated training without raw data sharing  
 2. **Explainability** — SHAP attributions for clinical/security audit  
@@ -257,8 +259,8 @@ while delivering competitive detection performance on a modern IoT intrusion ben
 If you use this code or results, please cite:
 
 ```bibtex
-@article{Mobeen2026IoMTFL,
-  title={Explainable Lightweight Federated Learning-Based Intrusion Detection System for Internet of Medical Things Using SHAP},
+@article{Mobeen2026IoTFL,
+  title={Lightweight Explainable Federated Learning for Intrusion Detection in Resource-Constrained IoT Devices: An Empirical Evaluation},
   author={Muhammad Ahmad Mobeen and Others},
   journal={Under Review},
   year={2026}
