@@ -1,9 +1,3 @@
-"""
-Publication-Quality Figure Generation
-CICIoT2023 IoMT Federated Learning — Springer Scientific Reports
-Compatible with updated federated_train / baselines / shap_analysis outputs.
-"""
-
 import os
 import gc
 import json

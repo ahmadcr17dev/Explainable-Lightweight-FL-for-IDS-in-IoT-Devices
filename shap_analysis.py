@@ -1,9 +1,3 @@
-"""
-Research-Grade SHAP Explainability Analysis
-CICIoT2023 IoMT Federated Learning — Springer Scientific Reports
-Kaggle: 30 GB RAM, Tesla P100 15 GB VRAM
-"""
-
 import os
 import gc
 import json

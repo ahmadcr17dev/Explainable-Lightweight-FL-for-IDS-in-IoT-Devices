@@ -1,307 +1,266 @@
 # Explainable Lightweight Federated Learning-Based Intrusion Detection System for IoMT
 
-[![Python](https://img.shields.io/badge/Python-3.10-blue.svg)]()
+[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)]()
 [![TensorFlow](https://img.shields.io/badge/TensorFlow-2.x-orange.svg)]()
+[![Dataset](https://img.shields.io/badge/Dataset-CICIoT2023-purple.svg)]()
 [![License](https://img.shields.io/badge/License-MIT-green.svg)]()
 
-Official implementation accompanying the research paper:
-
-**"Explainable Lightweight Federated Learning-Based Intrusion Detection System for Internet of Medical Things Using SHAP"**
+**Repository:** [Explainable-IDS-in-IOMT-using-FL](https://github.com/ahmadcr17dev/Explainable-IDS-in-IOMT-using-FL)
 
 ---
 
 ## Overview
 
-The rapid deployment of Internet of Medical Things (IoMT) devices has significantly increased cybersecurity risks in healthcare systems. Traditional centralized intrusion detection systems require transferring sensitive medical data to a central server, creating privacy concerns and regulatory challenges.
+Internet of Medical Things (IoMT) devices expand the attack surface of healthcare networks while producing highly sensitive traffic. Centralised intrusion detection requires shipping raw flows to a single server, which raises privacy, bandwidth, and regulatory concerns.
 
-This project proposes a **privacy-preserving Lightweight Federated Learning Intrusion Detection System (FL-IDS)** for IoMT environments.
+This project implements a **privacy-preserving lightweight Federated Learning Intrusion Detection System (FL-IDS)** for IoMT, evaluated on the **CICIoT2023** benchmark.
 
 The framework combines:
 
-- Lightweight Neural Networks
-- Federated Learning (FedAvg)
-- SHAP Explainable AI
-- Communication-Efficient Aggregation
-- Magnitude-Based Model Pruning
+- Lightweight MLP (logits output, suitable for edge deployment)
+- Federated Averaging (FedAvg) with optional Top-K communication reporting
+- Centralised warm-start + post-FL fine-tuning for strong accuracy
+- Magnitude-based model pruning
+- SHAP explainability for transparent decisions
+- Publication-ready figure and table generation
 
-allowing distributed intrusion detection without sharing raw medical data.
+---
+
+## Key Results (Proposed Method)
+
+On **protocol-level collapsed CICIoT2023** (Flood-* class scheme):
+
+| Metric | Value |
+|--------|------:|
+| **Test Accuracy** | **91.39%** |
+| **Weighted F1-score** | **91.63%** |
+
+Primary result files after training:
+
+- `results/meta.json` → `full_accuracy`, `full_f1`
+- `results/classification_report.json`
+- `results/best_global_model.keras`
 
 ---
 
 ## Main Contributions
 
-This research proposes:
-
-- Lightweight neural network suitable for resource-constrained IoMT devices
-- Federated Learning architecture for privacy-preserving collaborative training
-- SHAP-based explainability for transparent intrusion detection
-- Communication-efficient model aggregation
-- Magnitude pruning for lightweight deployment
-- Evaluation using the CICIoT2023 benchmark dataset
-
----
-
-## Framework
-
-The proposed workflow consists of the following stages:
-
-1. Dataset preprocessing
-2. Feature selection using Mutual Information
-3. Data normalization
-4. Federated client partitioning
-5. Local client training
-6. FedAvg aggregation
-7. Global model optimization
-8. Model pruning
-9. SHAP explainability
-10. Performance evaluation
+- Lightweight neural network designed for resource-constrained IoMT gateways
+- Federated learning so clients collaborate **without sharing raw traffic**
+- Protocol-level label collapse (`Flood-*`) to resolve DoS/DDoS flow ambiguity common in CICIoT2023
+- Communication-efficient design with Top-K sparsification reported as a paper metric
+- Post-training magnitude pruning for compact deployment
+- SHAP-based global and class-wise explainability
+- End-to-end reproducible pipeline (preprocess → train → baselines → SHAP → figures)
 
 ---
 
-## Dataset
+## Method Summary
 
-Experiments are performed using the **CICIoT2023** benchmark dataset developed by the Canadian Institute for Cybersecurity (CIC).
+### 1. Preprocessing (`preprocess.py`)
 
-The dataset contains realistic IoT traffic including:
+- Stream CICIoT2023 CSV shards
+- Normalize labels (case-insensitive) and collapse into protocol-level classes
+- Mutual-information ranking; **all numeric features** retained (`TOP_FEATS = None`)
+- Stratified train/test split (80/20)
+- StandardScaler normalisation
+- Log-scaled class-weight metadata (optional; training uses plain CE by default)
 
-- Benign Traffic
-- DDoS
-- DoS
-- Reconnaissance
-- Spoofing
-- Mirai
-- Web Attacks
-- Brute Force
-- Malware
+### 2. Label Scheme (Flood-* Collapse)
 
-Dataset characteristics:
+DoS and DDoS share near-identical flow statistics in CICIoT2023, which previously capped accuracy near ~70%. Labels are merged into **protocol-level flood categories**:
 
-- Millions of network flows
-- Multiple attack categories
-- Realistic IoT traffic
-- Modern attack scenarios
-- Suitable for Federated Learning research
+| Collapsed class | Source examples |
+|-----------------|-----------------|
+| Flood-ICMP | DDoS/DoS ICMP floods & fragmentation |
+| Flood-UDP | DDoS/DoS UDP floods & fragmentation |
+| Flood-TCP | DDoS/DoS TCP / PSHACK / RSTFIN / ACK fragmentation |
+| Flood-SYN | DDoS/DoS SYN floods |
+| Flood-HTTP | DDoS/DoS HTTP / Slowloris |
+| Mirai | GREETH / GREIP / UDPPLAIN |
+| Reconnaissance | Host discovery, OS/port scan, ping sweep, vuln scan |
+| Spoofing | DNS spoofing, MITM-ARP |
+| Brute_Force | Dictionary brute force |
+| Malware | Backdoor malware |
+| Web_Attack | XSS, SQLi, command injection, upload, browser hijacking |
+| Benign | Benign / BenignTraffic |
 
----
+### 3. Model (`model_def.py`)
 
-## Model Architecture
+Lightweight MLP with **logits** (no Softmax head; train with `from_logits=True`):
 
-The proposed lightweight neural network consists of:
+```
+Input (n_features)
+  → Dense(256) + LeakyReLU + BatchNorm + Dropout(0.15)
+  → Dense(128) + LeakyReLU + BatchNorm + Dropout(0.10)
+  → Dense(64)  + LeakyReLU + BatchNorm
+  → Dense(n_classes)  # logits
+```
 
-Input Layer
+### 4. Federated Training (`federated_train.py`)
 
-↓
+| Setting | Value |
+|---------|-------|
+| Clients | 10 |
+| Rounds | up to 40 (early stopping) |
+| Local epochs | 2 |
+| Client fraction | 1.0 |
+| Aggregation | Dense FedAvg (`TOP_K_TRAIN = 1.0`) |
+| Comm metric | Top-K 50% reported for paper |
+| Partitioning | Dirichlet α = 100 (near-IID) |
+| Warm-start | 8 epochs on ~1.2M stratified samples |
+| Fine-tune | up to 40 epochs on ~1.5M samples |
+| Loss | Sparse categorical cross-entropy |
 
-Dense (256)
+Pipeline stages inside training:
 
-↓
+1. Centralised warm-start  
+2. Federated local training + FedAvg  
+3. Global fine-tuning  
+4. Full test evaluation  
+5. Magnitude pruning + pruned evaluation  
 
-Batch Normalization
+### 5. Baselines, SHAP, Figures
 
-↓
-
-LeakyReLU
-
-↓
-
-Dropout
-
-↓
-
-Dense (128)
-
-↓
-
-Batch Normalization
-
-↓
-
-LeakyReLU
-
-↓
-
-Dropout
-
-↓
-
-Dense (64)
-
-↓
-
-Batch Normalization
-
-↓
-
-LeakyReLU
-
-↓
-
-Dropout
-
-↓
-
-Softmax Output Layer
-
----
-
-## Federated Learning Configuration
-
-- Federated Averaging (FedAvg)
-- Multiple distributed clients
-- Local client training
-- Global model aggregation
-- Communication-efficient updates
-- Privacy-preserving learning
-
-No raw medical data are transmitted between clients.
-
----
-
-## Explainable AI
-
-Model decisions are interpreted using **SHAP (SHapley Additive Explanations)**.
-
-Generated explanations include:
-
-- Global feature importance
-- Per-class feature importance
-- Local prediction explanations
-- Feature contribution visualization
+- `baselines.py` — centralised DNN and standard FL (no sparsification)
+- `shap_analysis.py` — global / class-wise SHAP importance
+- `generate_figure.py` — convergence, communication, confusion matrix, ROC/PR, comparison plots
 
 ---
 
 ## Repository Structure
 
 ```
-project/
-│
-├── preprocess.py
-├── model_def.py
-├── federated_train.py
-├── shap_analysis.py
-│
-├── processed/
-│
-├── results/
-│
-├── figures/
-│
+Explainable-IDS-in-IOMT-using-FL/
+├── model_def.py          # Lightweight MLP + pruning helpers
+├── preprocess.py         # CICIoT2023 streaming preprocess + Flood-* labels
+├── federated_train.py    # Warm-start + FL + fine-tune + prune (main results)
+├── baselines.py          # Centralised & standard FL baselines
+├── shap_analysis.py      # SHAP explainability
+├── generate_figure.py    # Publication figures & tables
 └── README.md
 ```
 
----
+On Kaggle, artefacts are written under:
 
-## Installation
-
-```bash
-git clone https://github.com/USERNAME/REPOSITORY.git
-
-cd REPOSITORY
-
-pip install -r requirements.txt
+```
+/kaggle/working/
+├── processed/            # X_train.npy, y_train.npy, class_names.csv, ...
+├── results/              # meta.json, models, reports, predictions
+└── figures/              # PNG/PDF figures + summary tables
 ```
 
 ---
 
-## Running the Project
+## Requirements
 
-### Step 1
+Typical stack (Kaggle GPU recommended):
 
-Preprocess dataset
-
-```bash
-python preprocess.py
-```
-
-### Step 2
-
-Train Federated Learning model
+- Python 3.10+
+- TensorFlow 2.x
+- NumPy, Pandas, scikit-learn
+- SHAP
+- Matplotlib
+- imbalanced-learn / psutil (as used by training utilities)
 
 ```bash
-python federated_train.py
+pip install tensorflow numpy pandas scikit-learn shap matplotlib psutil
 ```
 
-### Step 3
+---
 
-Generate SHAP explanations
+## How to Run (Kaggle)
 
-```bash
-python shap_analysis.py
+Attach the CICIoT2023 merged CSV dataset and place all `.py` files in `/kaggle/working` (or ensure `model_def.py` is importable).
+
+**Run order:**
+
+```text
+1. model_def.py
+2. preprocess.py
+3. federated_train.py      ← final accuracy / F1 here
+4. baselines.py
+5. shap_analysis.py
+6. generate_figure.py
 ```
+
+### Quick verification after training
+
+```python
+import json
+with open("/kaggle/working/results/meta.json") as f:
+    meta = json.load(f)
+print(meta["full_accuracy"], meta["full_f1"])
+```
+
+Expected headline range for the proposed method: **≥ 0.85–0.90** (this run: **0.9139 / 0.9163**).
 
 ---
 
 ## Evaluation Metrics
 
-The proposed model is evaluated using:
-
-- Accuracy
-- Precision
-- Recall
-- Weighted F1-score
-- Classification Report
-- Communication Cost
-- SHAP Feature Importance
+- Accuracy  
+- Precision / Recall / F1 (macro & weighted)  
+- Per-class classification report  
+- Confusion matrix  
+- ROC-AUC / Precision–Recall (when probabilities are saved)  
+- Communication cost (MB / round, cumulative)  
+- Pruned-model accuracy vs compression  
+- SHAP feature importance  
 
 ---
 
 ## Generated Outputs
 
-Training produces:
+### Results (`/kaggle/working/results/`)
 
-```
-results/
+| File | Description |
+|------|-------------|
+| `meta.json` | Headline accuracy, F1, rounds, communication, runtime |
+| `classification_report.json` | Per-class metrics |
+| `best_global_model.keras` / `.h5` | Final global model |
+| `pruned_model.keras` / `.h5` | Magnitude-pruned model |
+| `round_metrics.csv` | Per-round FL metrics |
+| `communication_history.csv` | Cumulative communication |
+| `y_test.npy`, `y_pred.npy`, `y_pred_proba.npy` | Predictions |
+| `confusion_matrix.npy` | Confusion matrix |
+| `baseline_results.json` | Centralised / standard FL comparisons |
+| `global_shap_importance.csv` | SHAP ranking |
 
-global_model.h5
+### Figures (`/kaggle/working/figures/`)
 
-classification_report.json
-
-round_metrics.csv
-
-meta.json
-
-feature_importance.csv
-
-y_pred.npy
-
-y_test.npy
-```
-
-Figures include:
-
-```
-figures/
-
-fig3_shap_global.png
-
-fig_shap_heatmap.png
-
-local_explanations/
-```
+- Convergence (accuracy / loss / communication)
+- Communication cost vs standard FL
+- Normalised confusion matrix
+- Per-class metrics
+- Model comparison bars / radar
+- ROC and Precision–Recall curves
+- Top SHAP feature importance
+- Publication CSV/TeX summary tables
 
 ---
 
 ## Research Motivation
 
-The proposed framework addresses three major challenges in IoMT security:
+The framework targets three IoMT security challenges at once:
 
-- Data Privacy
-- Explainability
-- Lightweight Deployment
+1. **Privacy** — federated training without raw data sharing  
+2. **Explainability** — SHAP attributions for clinical/security audit  
+3. **Lightweight deployment** — compact MLP + pruning for edge gateways  
 
-while maintaining competitive intrusion detection performance.
+while delivering competitive detection performance on a modern IoT intrusion benchmark.
 
 ---
 
 ## Citation
 
-If you use this work, please cite:
+If you use this code or results, please cite:
 
-```
-@article{YourPaper2026,
+```bibtex
+@article{Mobeen2026IoMTFL,
   title={Explainable Lightweight Federated Learning-Based Intrusion Detection System for Internet of Medical Things Using SHAP},
   author={Muhammad Ahmad Mobeen and Others},
-  journal={Construction Innovation (Under Review)},
+  journal={Under Review},
   year={2026}
 }
 ```
@@ -316,7 +275,7 @@ MIT License
 
 ## Acknowledgements
 
-- Canadian Institute for Cybersecurity (CIC)
-- CICIoT2023 Dataset
-- TensorFlow
-- SHAP
+- Canadian Institute for Cybersecurity (CIC) — CICIoT2023 dataset  
+- TensorFlow / Keras  
+- SHAP  
+- scikit-learn  
