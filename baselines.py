@@ -69,10 +69,11 @@ print(f"Train={len(X_train):,} Test={len(X_test):,}")
 
 results = {}
 
-def baseline_model():
+def baseline_model(total_steps=10000):
     return build_lightweight_model(
         n_features=N_FEATURES,
-        n_classes=N_CLASSES
+        n_classes=N_CLASSES,
+        total_steps=total_steps,
     )
 
 # ── BASELINE 1: Centralised ───────────────────────────────────
@@ -87,14 +88,19 @@ if os.path.exists(cw_path):
     with open(cw_path, "r") as f:
         class_weight = {int(k): float(v) for k, v in json.load(f).items()}
 
-cb = baseline_model()
+# CosineDecay is baked into the optimizer — do NOT use ReduceLROnPlateau
+# (it tries to assign optimizer.learning_rate and fails on Keras 3).
+CENTRAL_EPOCHS = 40
+CENTRAL_BS = 512
+steps_per_epoch = int(np.ceil(len(X_train) * 0.9 / CENTRAL_BS))
+cb = baseline_model(total_steps=steps_per_epoch * CENTRAL_EPOCHS)
 print(f"Params: {cb.count_params():,}")
 
 t0 = time.time()
 cb.fit(
     X_train, y_train,
-    epochs=40,
-    batch_size=512,
+    epochs=CENTRAL_EPOCHS,
+    batch_size=CENTRAL_BS,
     validation_split=0.1,
     class_weight=class_weight,
     verbose=1,
@@ -104,13 +110,6 @@ cb.fit(
             restore_best_weights=True,
             monitor="val_accuracy",
             mode="max",
-        ),
-        tf.keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss",
-            factor=0.5,
-            patience=2,
-            min_lr=1e-6,
-            verbose=1,
         ),
     ],
 )
